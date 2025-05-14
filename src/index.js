@@ -19,7 +19,7 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(
   cors({
-    origin: "https://vyapaar-backend.onrender.com",
+    origin: "https://vyapaar-frontend.vercel.app/",
     credentials: true,
   })
 );
