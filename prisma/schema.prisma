@@ -1,0 +1,223 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ListingType {
+  PRIVATE_INDIVIDUAL
+  PROFESSIONAL
+}
+
+model User {
+  id            String      @id @default(uuid())
+  email         String      @unique
+  password      String
+  firstName     String?
+  lastName      String?
+  phone         String?
+  city          String?
+  listings      Listing[]
+  favorites     Favorite[]
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  SearchQuery SearchQuery[]
+
+  RecieverMessage Message[] @relation(name: "receiverMessages")
+
+  SenderMessage Message[] @relation(name: "senderMessages")
+}
+
+model Admin {
+  id            String      @id @default(uuid())
+  name          String
+  email         String      @unique
+  password      String
+  permissions   String[]
+  approvals     AdminApproval[]
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+}
+
+model Category {
+  id            String      @id @default(uuid())
+  name          String      @unique
+  listings      Listing[]
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+}
+
+model Listing {
+  id            String     @id @default(uuid())
+  title         String
+  description   String
+  slug          String     @unique
+  type          ListingType
+  price         Float
+  negotiable    Boolean    @default(false)
+  city          String
+  tags          String[]
+  highlights    String[]
+  businessHours Json?
+  phone         String?
+  website       String?
+  status        ListingStatus @default(PENDING)
+  listingType   ListingTier
+  categoryId    String
+  category      Category   @relation(fields: [categoryId], references: [id])
+  userId        String
+  user          User       @relation(fields: [userId], references: [id])
+  images        Image[]
+  promotions    Promotion[]
+  businessCategory String?
+  establishedYear  Int?
+  serviceArea      String?
+  teamSize         String?
+  rating           Float?
+  reviewCount      Int?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  Favorite Favorite[]
+
+  ListingImage ListingImage[]
+
+  AdminApproval AdminApproval[]
+
+  Message Message[]
+}
+
+model Image {
+  id        String   @id @default(uuid())
+  url       String
+  isPrimary Boolean  @default(false)
+  listingId String
+  listing   Listing  @relation(fields: [listingId], references: [id])
+}
+
+enum ListingTier {
+  FREE
+  PREMIUM
+  LIFETIME_PREMIUM
+}
+
+model Promotion {
+  id            String        @id @default(uuid())
+  listing       Listing       @relation(fields: [listingId], references: [id])
+  listingId     String
+  promotionType PromotionType
+  price         Float
+  startDate     DateTime
+  endDate       DateTime?
+  duration      DurationType
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([listingId])
+  @@index([isActive])
+  @@index([endDate])
+}
+
+enum PromotionType {
+  TOP_PAGE_LISTING
+  TOP_PAGE_AD_PLUS
+  FEATURED_CATEGORY
+  URGENT_TAG
+  HIGHLIGHTED
+  LIFETIME_UPGRADE
+}
+
+model PricingPlan {
+  id            String        @id @default(uuid())
+  name          String
+  description   String
+  promotionType PromotionType
+  durationType  DurationType
+  price         Float
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+}
+
+enum DurationType {
+  SEVEN_DAYS
+  THIRTY_DAYS
+  NINETY_DAYS
+  LIFETIME
+}
+
+model Favorite {
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  listing   Listing  @relation(fields: [listingId], references: [id])
+  listingId String
+  createdAt DateTime @default(now())
+
+  @@unique([userId, listingId])
+}
+
+model ListingImage {
+  id            String      @id @default(uuid())
+  url           String
+  listing       Listing     @relation(fields: [listingId], references: [id])
+  listingId     String
+  isPrimary     Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+}
+
+enum ListingStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  ARCHIVED
+  EXPIRED
+}
+
+model AdminApproval {
+  id            String      @id @default(uuid())
+  listing       Listing     @relation(fields: [listingId], references: [id])
+  listingId     String @unique
+  admin         Admin       @relation(fields: [adminId], references: [id])
+  adminId       String
+  status        ListingStatus
+  comments      String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+}
+
+model Message {
+  id          String   @id @default(uuid())
+  sender      User     @relation(fields: [senderId], references: [id], name: "senderMessages")
+  senderId    String
+  receiver    User     @relation(fields: [receiverId], references: [id], name: "receiverMessages")
+  receiverId  String
+  listing     Listing? @relation(fields: [listingId], references: [id])
+  listingId   String?
+  content     String
+  isRead      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([listingId])
+}
+
+model SearchQuery {
+  id          String   @id @default(uuid())
+  user        User?    @relation(fields: [userId], references: [id])
+  userId      String?
+  query       String
+  filters     Json
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+}
