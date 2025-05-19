@@ -98,7 +98,7 @@ app.post("/register", async (req, res) => {
     res.cookie("token", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.sameSite,
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -141,7 +141,7 @@ app.post("/login", async (req, res) => {
     res.cookie("token", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.sameSite,
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -160,7 +160,7 @@ app.post("/logout", (req, res) => {
   res.clearCookie("token", {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    sameSite: process.env.sameSite,
   });
   res.status(200).json({ message: "Logged out successfully" });
 });
@@ -261,7 +261,7 @@ app.delete("/profile", authenticateToken, async (req, res) => {
     res.clearCookie("token", {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.sameSite,
     });
 
     res.json({ message: "Account deleted successfully" });

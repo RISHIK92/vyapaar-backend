@@ -213,7 +213,7 @@ app.post("/auth/register", async (req, res) => {
     res.cookie("token", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.sameSite,
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -258,7 +258,7 @@ app.post("/auth/login", async (req, res) => {
     res.cookie("token", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.sameSite,
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
@@ -277,7 +277,7 @@ app.post("/auth/logout", (req, res) => {
   res.clearCookie("token", {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    sameSite: process.env.sameSite,
   });
   res.status(200).json({ message: "Logged out successfully" });
 });
@@ -347,7 +347,7 @@ app.post("/admin/register", async (req, res) => {
     res.cookie("adminToken", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.sameSite,
       maxAge: 24 * 60 * 60 * 1000,
     });
 
@@ -392,7 +392,7 @@ app.post("/admin/login", async (req, res) => {
     res.cookie("adminToken", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      sameSite: process.env.sameSite,
       maxAge: 24 * 60 * 60 * 1000,
     });
 
@@ -411,7 +411,7 @@ app.post("/admin/logout", (req, res) => {
   res.clearCookie("adminToken", {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    sameSite: process.env.sameSite,
   });
   res.status(200).json({ message: "Admin logged out successfully" });
 });
