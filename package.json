@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently \"nodemon src/index.js\" \"nodemon src/script.js\"",
-    "start": "concurrently \"nodemon src/index.js\" \"nodemon src/script.js\""
+    "start": "npx prisma generate && npx prisma migrate deploy && concurrently \"node src/index.js\" \"node src/script.js\""
   },
   "keywords": [],
   "author": "",
