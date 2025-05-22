@@ -80,6 +80,9 @@ model Listing {
   expiresAt        DateTime
   isBannerEnabled  Boolean           @default(false)
   subscriptionId   String?
+  youtubeVideo     String?   // Add this line
+  locationUrl      String?   // Add this line
+  serviceRadius    Int? 
   AdminApproval    AdminApproval?
   Favorite         Favorite[]
   images           Image[]
@@ -201,6 +204,23 @@ model Payment {
 
   @@index([listingId])
   @@index([transactionId])
+}
+
+model OfferZone {
+  id           Int       @id @default(autoincrement())
+  vendorName   String
+  discount     String
+  promoCode    String
+  category     String
+  description  String
+  validUntil   String
+  rating       Float
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @default(now())
+
+  @@index([isActive])
+  @@index([validUntil])
 }
 
 enum ListingType {

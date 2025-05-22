@@ -9,6 +9,11 @@ import { uploadFileToS3 } from "./utils/upload.js";
 import authenticateToken from "./middleware/auth.js";
 import multer from "multer";
 import paymentRoutes from "./routes/payment.js";
+import locationRoutes from "./routes/location.js";
+import NodeCache from "node-cache";
+import axios from "axios";
+
+const pincodeCache = new NodeCache({ stdTTL: 86400 });
 
 dotenv.config();
 
@@ -47,6 +52,8 @@ const calculateExpirationDate = (durationDays) => {
 };
 
 app.use("/payments", paymentRoutes);
+app.use("/location", locationRoutes);
+
 // Auth Endpoints
 app.post("/register", async (req, res) => {
   try {
@@ -274,10 +281,11 @@ app.delete("/profile", authenticateToken, async (req, res) => {
 app.get("/listings", authenticateToken, async (req, res) => {
   try {
     const listings = await prisma.listing.findMany({
-      where: { userId: req.user.userId },
+      where: { userId: req.user.userId, status: { not: "PENDING_PAYMENT" } },
       include: {
         category: true,
         images: true,
+        city: true,
       },
       orderBy: {
         createdAt: "desc",
@@ -295,6 +303,11 @@ app.get("/list/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
 
+    // Validate slug parameter
+    if (!slug || typeof slug !== "string") {
+      return res.status(400).json({ message: "Invalid listing slug" });
+    }
+
     const listing = await prisma.listing.findFirst({
       where: {
         slug: slug,
@@ -302,7 +315,12 @@ app.get("/list/:slug", async (req, res) => {
       },
       include: {
         category: true,
-        images: true,
+        images: {
+          orderBy: {
+            isPrimary: "desc", // Show primary image first
+          },
+        },
+        city: true,
         user: {
           select: {
             id: true,
@@ -317,48 +335,85 @@ app.get("/list/:slug", async (req, res) => {
         promotions: {
           where: {
             isActive: true,
+            OR: [{ endDate: null }, { endDate: { gte: new Date() } }],
           },
           orderBy: {
             createdAt: "desc",
           },
           take: 1,
         },
+        subscription: {
+          select: {
+            name: true,
+            tierType: true,
+          },
+        },
       },
     });
 
     if (!listing) {
-      return res.status(404).json({ message: "Listing not found" });
+      return res
+        .status(404)
+        .json({ message: "Listing not found or not approved" });
     }
 
     const similarListings = await prisma.listing.findMany({
       where: {
-        categoryId: listing.categoryId,
-        status: "APPROVED",
-        NOT: {
-          id: listing.id,
-        },
+        AND: [
+          {
+            status: "APPROVED",
+            NOT: { id: listing.id },
+          },
+          {
+            OR: [
+              { categoryId: String(listing.categoryId) }, // Same category
+              ...(listing.cityId ? [{ cityId: String(listing.cityId) }] : []), // Same city (if exists)
+            ],
+          },
+        ],
       },
       take: 4,
       include: {
-        images: true,
+        images: { take: 1, orderBy: { isPrimary: "desc" } },
+        city: true,
+        category: true,
         promotions: {
           where: {
             isActive: true,
+            OR: [{ endDate: null }, { endDate: { gte: new Date() } }],
           },
           take: 1,
         },
       },
-      orderBy: {
-        createdAt: "desc",
-      },
+      orderBy: [
+        { listingTier: "desc" }, // Premium first
+        { createdAt: "desc" },
+      ],
     });
 
-    res.json({
-      listing,
-      similarListings,
-    });
+    // Format response data
+    const responseData = {
+      listing: {
+        ...listing,
+      },
+      similarListings: similarListings.map((listing) => ({
+        ...listing,
+        city: listing.city?.name || "Unknown Location",
+      })),
+    };
+
+    res.json(responseData);
   } catch (error) {
     console.error("Listing details error:", error);
+
+    // Handle Prisma specific errors
+    if (error) {
+      return res.status(500).json({
+        message: "Database error",
+        code: error.code,
+      });
+    }
+
     res.status(500).json({ message: "Error fetching listing details" });
   }
 });
@@ -400,13 +455,16 @@ app.get("/listing/professional", async (req, res) => {
     }
 
     if (location && location !== "All Locations") {
-      where.city = location;
+      where.city = {
+        name: location,
+      };
     }
 
     const listings = await prisma.listing.findMany({
       where,
       include: {
         category: true,
+        city: true, // Include city relation
         images: true,
         user: {
           select: {
@@ -482,6 +540,31 @@ app.get("/listings/archived", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Error fetching archived listings" });
   }
 });
+
+app.get(
+  "/listings/:listingId/favorite/check",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { listingId } = req.params;
+      const userId = req.user.userId;
+
+      const favorite = await prisma.favorite.findUnique({
+        where: {
+          userId_listingId: {
+            userId: parseInt(userId),
+            listingId: parseInt(listingId),
+          },
+        },
+      });
+
+      res.json({ isFavorite: !!favorite });
+    } catch (error) {
+      console.error("Error checking favorite:", error);
+      res.status(500).json({ error: "Error checking favorite status" });
+    }
+  }
+);
 
 app.get("/listings/favorites", authenticateToken, async (req, res) => {
   try {
@@ -616,7 +699,7 @@ app.post("/listings/:id/favorite", authenticateToken, async (req, res) => {
     const favorite = await prisma.favorite.create({
       data: {
         userId: req.user.userId,
-        listingId: id,
+        listingId: parseInt(id),
       },
       include: {
         listing: true,
@@ -638,7 +721,7 @@ app.delete("/listings/:id/favorite", authenticateToken, async (req, res) => {
       where: {
         userId_listingId: {
           userId: req.user.userId,
-          listingId: id,
+          listingId: parseInt(id),
         },
       },
     });
@@ -704,6 +787,9 @@ app.post("/listings", authenticateToken, async (req, res) => {
       reviewCount,
       listingTier = "FREE",
       subscriptionId,
+      youtubeVideo,
+      locationUrl,
+      serviceRadius,
     } = req.body;
 
     if (!category || !title || !description || !city) {
@@ -801,9 +887,7 @@ app.post("/listings", authenticateToken, async (req, res) => {
         type: type === "Professional" ? "PROFESSIONAL" : "PRIVATE_INDIVIDUAL",
         price: parseFloat(price) || 0,
         negotiable: negotiable === "true" || negotiable === true,
-        // Use either category connection OR categoryId, not both:
         category: { connect: { id: categoryRecord.id } },
-        // Remove this line: categoryId: categoryRecord.id,
         user: { connect: { id: req.user.userId } },
         city: { connect: { id: cityRecord.id } },
         tags: Array.isArray(tags) ? tags : tags?.split(",") || [],
@@ -824,6 +908,9 @@ app.post("/listings", authenticateToken, async (req, res) => {
         slug,
         expiresAt: expiresAt,
         isBannerEnabled,
+        youtubeVideo: youtubeVideo || null,
+        locationUrl: locationUrl || null,
+        serviceRadius: serviceRadius ? parseInt(serviceRadius) : null,
         subscription: subscriptionPlan
           ? { connect: { id: subscriptionPlan.id } }
           : null,
@@ -996,14 +1083,42 @@ app.post("/cities", authenticateToken, async (req, res) => {
 
 app.get("/listings/random", async (req, res) => {
   try {
-    // Option 1: Efficient random sampling for large datasets
-    const total = await prisma.listing.count({
-      where: { status: "APPROVED" },
-    });
+    const { pincode } = req.query;
 
-    const skip = Math.floor(Math.random() * Math.max(0, total - 6));
+    if (!pincode) {
+      // Fallback to original random sampling if no pincode provided
+      const total = await prisma.listing.count({
+        where: { status: "APPROVED" },
+      });
+      const skip = Math.floor(Math.random() * Math.max(0, total - 6));
 
-    const listings = await prisma.listing.findMany({
+      const listings = await prisma.listing.findMany({
+        where: { status: "APPROVED" },
+        include: {
+          category: true,
+          images: {
+            where: { isPrimary: true },
+            take: 1,
+          },
+        },
+        take: 6,
+        skip: skip,
+        orderBy: { createdAt: "desc" },
+      });
+
+      return res.json(formatListings(listings));
+    }
+
+    // Step 1: Convert pincode to coordinates using a geocoding API
+    const pincodeCoords = await getCoordinatesFromPincode(pincode);
+    if (!pincodeCoords) {
+      return res.status(400).json({
+        error: "Could not determine location for the provided pincode",
+      });
+    }
+
+    // Step 2: Get all approved listings with their location data
+    const allListings = await prisma.listing.findMany({
       where: { status: "APPROVED" },
       include: {
         category: true,
@@ -1012,59 +1127,103 @@ app.get("/listings/random", async (req, res) => {
           take: 1,
         },
       },
-      take: 6,
-      skip: skip,
-      orderBy: { createdAt: "desc" },
     });
 
-    // Option 2: True random sampling (better for smaller datasets)
-    /*
-    const allIds = await prisma.listing.findMany({
-      where: { status: 'APPROVED' },
-      select: { id: true }
-    });
-    
-    const shuffled = allIds.sort(() => 0.5 - Math.random());
-    const selectedIds = shuffled.slice(0, 6).map(item => item.id);
+    // Step 3: Calculate distance for each listing and sort by nearest
+    const listingsWithDistance = await Promise.all(
+      allListings.map(async (listing) => {
+        try {
+          // Get coordinates from listing's location data (could be address, pincode, etc.)
+          const listingCoords = await getCoordinatesFromListing(listing);
+          if (!listingCoords) {
+            return { ...listing, distance: Infinity };
+          }
 
-    const listings = await prisma.listing.findMany({
-      where: { 
-        id: { in: selectedIds },
-        status: 'APPROVED' 
-      },
-      include: {
-        category: true,
-        images: {
-          where: { isPrimary: true },
-          take: 1
+          const distance = calculateDistance(
+            pincodeCoords.lat,
+            pincodeCoords.lng,
+            listingCoords.lat,
+            listingCoords.lng
+          );
+
+          return { ...listing, distance };
+        } catch (error) {
+          console.error(`Error processing listing ${listing.id}:`, error);
+          return { ...listing, distance: Infinity };
         }
-      }
-    });
-    */
+      })
+    );
 
-    // Format response
-    const formattedListings = listings.map((listing) => ({
-      id: listing.id,
-      title: listing.title,
-      category: listing.category.name,
-      subcategory: listing.businessCategory || "",
-      location: listing.city,
-      date: listing.createdAt.toISOString(),
-      images:
-        listing.images.length +
-        (listing.images.some((img) => img.isPrimary) ? 0 : 1),
-      imageSrc: listing.images[0]?.url || "/api/placeholder/400/300",
-    }));
+    // Step 4: Filter out invalid listings and get the nearest 6
+    const nearestListings = listingsWithDistance
+      .filter((listing) => listing.distance !== Infinity)
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, 6);
 
-    res.json(formattedListings);
+    res.json(formatListings(nearestListings));
   } catch (error) {
-    console.error("Error fetching random listings:", error);
+    console.error("Error fetching listings:", error);
     res.status(500).json({
-      error: "Failed to fetch random listings",
+      error: "Failed to fetch listings",
       details: error.message,
     });
   }
 });
+
+// Helper function to get coordinates from a listing
+async function getCoordinatesFromListing(listing) {
+  // Priority 1: If listing has a Google Maps URL, extract coords from it
+  if (listing.locationUrl) {
+    const coords = await extractCoordsFromUrl(listing.locationUrl);
+    if (coords) return coords;
+  }
+
+  // Priority 2: If listing has a pincode, geocode it
+  if (listing.pincode) {
+    const coords = await getCoordinatesFromPincode(listing.pincode);
+    if (coords) return coords;
+  }
+
+  // Priority 3: If listing has city/address, try to geocode that
+  if (listing.city) {
+    try {
+      const response = await axios.get(
+        `https://nominatim.openstreetmap.org/search?city=${encodeURIComponent(
+          listing.city
+        )}&format=json&limit=1`
+      );
+      if (response.data && response.data.length > 0) {
+        return {
+          lat: parseFloat(response.data[0].lat),
+          lng: parseFloat(response.data[0].lon),
+        };
+      }
+    } catch (error) {
+      console.error("Error geocoding city:", error);
+    }
+  }
+
+  return null;
+}
+
+// Helper function to format listings response
+function formatListings(listings) {
+  return listings.map((listing) => ({
+    id: listing.id,
+    title: listing.title,
+    category: listing.category.name,
+    subcategory: listing.businessCategory || "",
+    location: listing.city,
+    date: listing.createdAt.toISOString(),
+    images:
+      listing.images.length +
+      (listing.images.some((img) => img.isPrimary) ? 0 : 1),
+    imageSrc: listing.images[0]?.url || "/api/placeholder/400/300",
+    distance: listing.distance
+      ? `${listing.distance.toFixed(1)} km`
+      : undefined,
+  }));
+}
 
 app.post("/listings/:id/promote", authenticateToken, async (req, res) => {
   try {
@@ -1127,7 +1286,9 @@ app.post("/listings/:id/promote", authenticateToken, async (req, res) => {
 app.get("/banners", async (req, res) => {
   try {
     const currentDate = new Date();
+    const userPincode = req.query.pincode?.toString();
 
+    // Base query
     const banners = await prisma.listing.findMany({
       where: {
         status: "APPROVED",
@@ -1141,20 +1302,13 @@ app.get("/banners", async (req, res) => {
               },
             },
           },
-          {
-            subscription: {
-              promotionDays: { gt: 0 },
-              isActive: true,
-            },
-          },
+          { subscription: { promotionDays: { gt: 0 }, isActive: true } },
         ],
       },
       include: {
         category: true,
-        images: {
-          where: { isBanner: true },
-          take: 1,
-        },
+        city: true,
+        images: { where: { isBanner: true }, take: 1 },
         promotions: {
           where: {
             isActive: true,
@@ -1165,47 +1319,233 @@ app.get("/banners", async (req, res) => {
         },
         subscription: true,
       },
-      orderBy: {
-        createdAt: "desc",
-      },
-      take: 10,
+      orderBy: { createdAt: "desc" },
     });
 
-    const formattedBanners = banners.map((listing) => {
-      const promotion =
-        listing.promotions[0] ||
-        (listing.subscription
-          ? {
-              startDate: listing.createdAt,
-              endDate: calculateExpirationDate(
-                listing.subscription.promotionDays
-              ),
-              durationDays: listing.subscription.promotionDays,
-              isActive: true,
-            }
-          : null);
+    // If no pincode, return all banners
+    if (!userPincode) {
+      return res.json(formatBanners(banners.slice(0, 10)));
+    }
 
-      return {
-        id: listing.id,
-        imageUrl: listing.images[0]?.url || "/placeholder-banner.jpg",
-        title: listing.title,
-        subtitle: `${listing.category?.name || "Item"} in ${
-          listing.city || "your area"
-        }`,
-        link: `/list/${listing.slug}`,
-        promotionType: "STANDARD",
-        promotionEndDate: promotion?.endDate,
-        isSubscriptionPromotion:
-          !listing.promotions.length && !!listing.subscription,
-      };
-    });
+    // Get coordinates from geocoding service
+    const userCoords = await getCoordinatesFromPincode(userPincode);
 
-    res.json(formattedBanners);
+    // Filter banners based on location
+    const filteredBanners = await Promise.all(
+      banners.map(async (listing) => {
+        // Always include listings without service radius
+        if (
+          listing.serviceRadius === null ||
+          listing.serviceRadius === undefined
+        ) {
+          return listing;
+        }
+
+        // Exclude listings that require location if we don't have user coordinates
+        if (!userCoords) {
+          return null;
+        }
+
+        // Skip listings without locationUrl if they have service radius
+        if (!listing.locationUrl) {
+          return null;
+        }
+
+        try {
+          const listingCoords = await extractCoordsFromUrl(listing.locationUrl);
+          if (!listingCoords) return null;
+
+          const distance = calculateDistance(
+            userCoords.lat,
+            userCoords.lng,
+            listingCoords.lat,
+            listingCoords.lng
+          );
+
+          console.log(`Distance for listing ${listing.id}:`, distance, "km");
+          console.log(
+            `Service radius for listing ${listing.id}:`,
+            listing.serviceRadius,
+            "km"
+          );
+
+          // Convert both to meters for comparison
+          const distanceInMeters = distance * 1000;
+          const radiusInMeters = listing.serviceRadius * 1000;
+
+          // Only include if distance is within service radius
+          if (distanceInMeters <= radiusInMeters) {
+            console.log(`Including listing ${listing.id} - within radius`);
+            return listing;
+          } else {
+            console.log(`Excluding listing ${listing.id} - outside radius`);
+            return null;
+          }
+        } catch (error) {
+          console.error(
+            `Error processing listing ${listing.id}:`,
+            error.message
+          );
+          return null;
+        }
+      })
+    );
+
+    // Filter out null values and get the first 10
+    const validBanners = filteredBanners.filter(Boolean).slice(0, 10);
+
+    console.log("Final banners count:", validBanners.length);
+    res.json(formatBanners(validBanners));
   } catch (error) {
     console.error("Error fetching banners:", error);
     res.status(500).json({ error: "Failed to fetch banners" });
   }
 });
+
+async function resolveShortUrl(url) {
+  try {
+    const response = await axios.head(url, {
+      maxRedirects: 5,
+      validateStatus: null,
+    });
+    return response.request.res.responseUrl || url;
+  } catch (error) {
+    console.error(`Error resolving short URL ${url}:`, error.message);
+    return url; // Return original if resolution fails
+  }
+}
+
+// Helper function to extract coordinates from URL
+async function extractCoordsFromUrl(url) {
+  try {
+    if (url.includes("goo.gl") || url.includes("maps.app.goo.gl")) {
+      url = await resolveShortUrl(url);
+    }
+
+    // Rest of your existing code remains the same...
+    if (url.includes("@")) {
+      const parts = url.split("@")[1].split(",");
+      if (parts.length >= 2) {
+        return {
+          lat: parseFloat(parts[0]),
+          lng: parseFloat(parts[1]),
+        };
+      }
+    }
+
+    // Handle URL with query parameters
+    const urlObj = new URL(url);
+    const qParam = urlObj.searchParams.get("q");
+    if (qParam) {
+      const coords = qParam.split(",");
+      if (coords.length === 2) {
+        return {
+          lat: parseFloat(coords[0]),
+          lng: parseFloat(coords[1]),
+        };
+      }
+    }
+
+    // Handle URL with /place/ format
+    const placeMatch = url.match(/!3d([\d.-]+)!4d([\d.-]+)/);
+    if (placeMatch) {
+      return {
+        lat: parseFloat(placeMatch[1]),
+        lng: parseFloat(placeMatch[2]),
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Error extracting coords from URL ${url}:`, error.message);
+    return null;
+  }
+}
+
+// Distance calculation helper
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Radius of the earth in km
+  const dLat = deg2rad(lat2 - lat1);
+  const dLon = deg2rad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(deg2rad(lat1)) *
+      Math.cos(deg2rad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c; // Distance in km
+}
+
+function deg2rad(deg) {
+  return deg * (Math.PI / 180);
+}
+
+// Format banners for response
+function formatBanners(banners) {
+  return banners.map((listing) => {
+    const promotion =
+      listing.promotions[0] ||
+      (listing.subscription
+        ? {
+            startDate: listing.createdAt,
+            endDate: new Date(
+              listing.createdAt.getTime() +
+                listing.subscription.promotionDays * 86400000
+            ),
+            durationDays: listing.subscription.promotionDays,
+            isActive: true,
+          }
+        : null);
+
+    return {
+      id: listing.id,
+      imageUrl: listing.images[0]?.url || "/placeholder-banner.jpg",
+      title: listing.title,
+      subtitle: `${listing.category?.name || "Item"} in ${
+        listing.city?.name || "your area"
+      }`,
+      link: `/list/${listing.slug}`,
+      promotionType: "STANDARD",
+      promotionEndDate: promotion?.endDate,
+      isSubscriptionPromotion:
+        !listing.promotions.length && !!listing.subscription,
+    };
+  });
+}
+
+async function getCoordinatesFromPincode(pincode) {
+  try {
+    // Check cache first
+    const cachedCoords = pincodeCache.get(pincode);
+    if (cachedCoords) return cachedCoords;
+
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/geocode/json`,
+      {
+        params: {
+          address: pincode,
+          components: "country:IN",
+          key: process.env.GOOGLE_MAPS_API_KEY,
+        },
+      }
+    );
+
+    if (response.data.status === "OK" && response.data.results?.length > 0) {
+      const location = response.data.results[0].geometry.location;
+      const coords = { lat: location.lat, lng: location.lng };
+
+      // Cache the result
+      pincodeCache.set(pincode, coords);
+      return coords;
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Geocoding failed for pincode ${pincode}:`, error.message);
+    return null;
+  }
+}
 
 app.get("/subscription-plans", async (req, res) => {
   try {
@@ -1258,6 +1598,123 @@ app.get("/subscription-plans", async (req, res) => {
   } catch (error) {
     console.error("Error fetching subscription plans:", error);
     res.status(500).json({ error: "Failed to fetch subscription plans" });
+  }
+});
+
+app.get("/payment", authenticateToken, async (req, res) => {
+  try {
+    // Get all payments for listings owned by the authenticated user
+    const payments = await prisma.payment.findMany({
+      where: {
+        listing: {
+          userId: req.user.userId,
+        },
+      },
+      include: {
+        listing: {
+          select: {
+            title: true,
+            status: true,
+            listingTier: true,
+            subscription: {
+              select: {
+                name: true,
+                durationDays: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    if (!payments || payments.length === 0) {
+      return res
+        .status(404)
+        .json({ message: "No payments found for this user" });
+    }
+
+    // Format the response data
+    const formattedPayments = payments.map((payment) => ({
+      id: payment.id,
+      amount: payment.amount,
+      currency: payment.currency,
+      paymentMethod: payment.paymentMethod,
+      status: payment.status,
+      transactionId: payment.transactionId,
+      createdAt: payment.createdAt,
+      listing: {
+        id: payment.listingId,
+        title: payment.listing.title,
+        status: payment.listing.status,
+        tier: payment.listing.listingTier,
+        subscription: payment.listing.subscription,
+      },
+    }));
+
+    res.json({
+      success: true,
+      data: formattedPayments,
+    });
+  } catch (error) {
+    console.error("Payment fetch error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch payment history",
+      details: error.message,
+    });
+  }
+});
+
+app.get("/offer-zone", async (req, res) => {
+  try {
+    const currentDate = new Date().toISOString().split("T")[0];
+
+    const offers = await prisma.offerZone.findMany({
+      where: {
+        isActive: true,
+        validUntil: {
+          gte: currentDate,
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+      select: {
+        id: true,
+        vendorName: true,
+        discount: true,
+        promoCode: true,
+        category: true,
+        description: true,
+        validUntil: true,
+        rating: true,
+      },
+    });
+
+    if (offers.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No active offers found",
+        data: [],
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      count: offers.length,
+      data: offers,
+    });
+  } catch (error) {
+    console.error("Error fetching offers:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  } finally {
+    await prisma.$disconnect();
   }
 });
 

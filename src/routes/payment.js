@@ -209,29 +209,42 @@ router.post("/create-order", async (req, res) => {
     const { amount, currency, listingId, pricingOption, subscriptionId } =
       req.body;
 
-    const pricingOptions = {
-      FREE: 0,
-      PREMIUM: 850,
-      PREMIUM_PLUS: 15000,
-    };
+    const subscriptionPlans = await prisma.subscriptionPlan.findMany({
+      where: { isActive: true },
+      select: {
+        tierType: true,
+        price: true,
+      },
+    });
+
+    const pricingOptions = {};
+    subscriptionPlans.forEach((plan) => {
+      pricingOptions[plan.tierType] = Number(plan.price * 100);
+    });
 
     if (!Object.keys(pricingOptions).includes(pricingOption)) {
       return res.status(400).json({ error: "Invalid pricing option" });
     }
 
-    if (pricingOption !== "FREE" && amount !== pricingOptions[pricingOption]) {
-      return res
-        .status(400)
-        .json({ error: "Amount doesn't match pricing option" });
+    if (
+      pricingOption !== "FREE" &&
+      Number(amount) !== pricingOptions[pricingOption]
+    ) {
+      return res.status(400).json({
+        error: "Amount doesn't match pricing option",
+        expectedAmount: pricingOptions[pricingOption],
+        receivedAmount: amount,
+      });
     }
 
+    // Handle free listing
     if (pricingOption === "FREE") {
       await updateListingAfterPayment(listingId, "FREE", "free_listing");
       return res.json({
         order: {
           id: "free_listing",
           amount: 0,
-          currency: "INR",
+          currency: currency || "INR",
           status: "created",
         },
         success: true,
@@ -255,7 +268,10 @@ router.post("/create-order", async (req, res) => {
     res.json({ order });
   } catch (error) {
     console.error("Error creating order:", error);
-    res.status(500).json({ error: "Failed to create payment order" });
+    res.status(500).json({
+      error: "Failed to create payment order",
+      details: error.message,
+    });
   }
 });
 

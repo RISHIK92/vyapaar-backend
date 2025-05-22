@@ -52,7 +52,7 @@ const cleanupRejectedListings = async () => {
         prisma.promotion.deleteMany({
           where: { listingId: { in: listingIds } },
         }),
-        prisma.listingImage.deleteMany({
+        prisma.image.deleteMany({
           where: { listingId: { in: listingIds } },
         }),
         prisma.favorite.deleteMany({
@@ -111,8 +111,7 @@ const promoteListingBasedOnTier = async () => {
   }
 };
 
-// Authentication Middleware
-const authenticateToken = () => {
+const authenticateToken = (req, res, next) => {
   const token = req.cookies.token;
 
   if (!token) {
@@ -468,7 +467,7 @@ app.get("/listings", async (req, res) => {
       where,
       include: {
         category: true,
-        ListingImage: {
+        images: {
           take: 1,
           where: { isPrimary: true },
         },
@@ -510,7 +509,7 @@ app.get("/listings/featured", async (req, res) => {
       },
       include: {
         category: true,
-        ListingImage: {
+        images: {
           take: 1,
           where: { isPrimary: true },
         },
@@ -533,43 +532,107 @@ app.get("/listings/featured", async (req, res) => {
 
 app.get("/listing/:slug", async (req, res) => {
   try {
+    // First try to parse as ID (for backward compatibility)
     const id = parseInt(req.params.slug);
+    const isIdLookup = !isNaN(id);
 
-    if (isNaN(id)) {
-      return res.status(400).json({ error: "Invalid listing ID" });
-    }
+    let listing;
 
-    const listing = await prisma.listing.findUnique({
-      where: { id },
-      include: {
-        category: true,
-        ListingImage: true,
-        user: {
-          select: {
-            id: true,
-            firstName: true,
-            lastName: true,
-            phone: true,
+    if (isIdLookup) {
+      listing = await prisma.listing.findUnique({
+        where: { id },
+        include: {
+          category: true,
+          images: true, // Changed from ListingImage to images to match your model
+          city: true,
+          user: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              phone: true,
+            },
           },
+          promotions: {
+            where: { isActive: true },
+            orderBy: { createdAt: "desc" },
+          },
+          subscription: true,
+          Favorite: true,
         },
-        promotions: {
-          where: { isActive: true },
-          orderBy: { createdAt: "desc" },
+      });
+    } else {
+      // Try to find by slug if not a numeric ID
+      listing = await prisma.listing.findUnique({
+        where: { slug: req.params.slug },
+        include: {
+          category: true,
+          images: true,
+          city: true,
+          user: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              phone: true,
+            },
+          },
+          promotions: {
+            where: { isActive: true },
+            orderBy: { createdAt: "desc" },
+          },
+          subscription: true,
+          Favorite: true,
         },
-      },
-    });
+      });
+    }
 
     if (!listing) {
       return res.status(404).json({ message: "Listing not found" });
     }
 
-    // Increment view count (consider adding a view count field to your schema)
-    await prisma.listing.update({
-      where: { id: listing.id },
-      data: { viewCount: { increment: 1 } },
-    });
+    // Format the response to include all fields
+    const response = {
+      ...listing,
+      // Explicitly include all important fields
+      id: listing.id,
+      title: listing.title,
+      description: listing.description,
+      slug: listing.slug,
+      type: listing.type,
+      price: listing.price,
+      negotiable: listing.negotiable,
+      tags: listing.tags,
+      highlights: listing.highlights,
+      businessHours: listing.businessHours,
+      phone: listing.phone,
+      website: listing.website,
+      status: listing.status,
+      listingTier: listing.listingTier,
+      city: listing.city,
+      category: listing.category,
+      businessCategory: listing.businessCategory,
+      establishedYear: listing.establishedYear,
+      serviceArea: listing.serviceArea,
+      teamSize: listing.teamSize,
+      rating: listing.rating,
+      reviewCount: listing.reviewCount,
+      createdAt: listing.createdAt,
+      updatedAt: listing.updatedAt,
+      expiresAt: listing.expiresAt,
+      isBannerEnabled: listing.isBannerEnabled,
+      youtubeVideo: listing.youtubeVideo,
+      locationUrl: listing.locationUrl,
+      serviceRadius: listing.serviceRadius,
+      AdminApproval: listing.AdminApproval,
+      images: listing.images,
+      user: listing.user,
+      promotions: listing.promotions,
+      subscription: listing.subscription,
+      Favorite: listing.Favorite,
+    };
 
-    res.json(listing);
+    res.json(response);
   } catch (error) {
     console.error("Get listing error:", error);
     res.status(500).json({ message: "Error fetching listing" });
@@ -636,7 +699,7 @@ app.post("/listings", authenticateToken, async (req, res) => {
 
     // Add images
     if (images && images.length > 0) {
-      await prisma.listingImage.createMany({
+      await prisma.image.createMany({
         data: images.map((img, index) => ({
           url: img,
           listingId: listing.id,
@@ -722,10 +785,10 @@ app.put("/listings/:id", authenticateToken, async (req, res) => {
     // Update images
     if (images && images.length > 0) {
       // Delete existing images
-      await prisma.listingImage.deleteMany({ where: { listingId: id } });
+      await prisma.image.deleteMany({ where: { listingId: id } });
 
       // Add new images
-      await prisma.listingImage.createMany({
+      await prisma.image.createMany({
         data: images.map((img, index) => ({
           url: img,
           listingId: id,
@@ -761,7 +824,7 @@ app.delete("/listings/:id", authenticateToken, async (req, res) => {
 
     // Delete related records
     await prisma.promotion.deleteMany({ where: { listingId: id } });
-    await prisma.listingImage.deleteMany({ where: { listingId: id } });
+    await prisma.image.deleteMany({ where: { listingId: id } });
     await prisma.favorite.deleteMany({ where: { listingId: id } });
     await prisma.adminApproval.deleteMany({ where: { listingId: id } });
 
@@ -787,7 +850,7 @@ app.get("/users/me/listings", authenticateToken, async (req, res) => {
       where,
       include: {
         category: true,
-        ListingImage: {
+        images: {
           take: 1,
           where: { isPrimary: true },
         },
@@ -825,7 +888,7 @@ app.get("/favorites", authenticateToken, async (req, res) => {
         listing: {
           include: {
             category: true,
-            ListingImage: {
+            images: {
               take: 1,
               where: { isPrimary: true },
             },
@@ -1054,7 +1117,7 @@ app.post("/search", async (req, res) => {
       where,
       include: {
         category: true,
-        ListingImage: {
+        images: {
           take: 1,
           where: { isPrimary: true },
         },
@@ -1088,7 +1151,7 @@ app.get("/admin/listings", authenticateAdmin(), async (req, res) => {
       where,
       include: {
         category: true,
-        ListingImage: {
+        images: {
           take: 1,
         },
         user: {
@@ -1132,7 +1195,7 @@ app.get("/admin/listings/:id", authenticateAdmin(), async (req, res) => {
       where: { id: parseInt(id) },
       include: {
         category: true,
-        ListingImage: true,
+        images: true,
         user: {
           select: {
             id: true,
@@ -2025,7 +2088,7 @@ app.put(
     try {
       // Check if user is admin
       const admin = await prisma.admin.findUnique({
-        where: { id: parseInt(req.user.userId) },
+        where: { id: String(req.user.userId) },
       });
 
       if (!admin) {
@@ -2056,6 +2119,247 @@ app.put(
     }
   }
 );
+
+app.get("/offer-zone", authenticateToken, async (req, res) => {
+  try {
+    const currentDate = new Date().toISOString().split("T")[0];
+
+    const offers = await prisma.offerZone.findMany({
+      where: {
+        isActive: true,
+        validUntil: {
+          gte: currentDate,
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+      select: {
+        id: true,
+        vendorName: true,
+        discount: true,
+        promoCode: true,
+        description: true,
+        validUntil: true,
+        rating: true,
+      },
+    });
+
+    if (offers.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No active offers found",
+        data: [],
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      count: offers.length,
+      data: offers,
+    });
+  } catch (error) {
+    console.error("Error fetching offers:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error",
+    });
+  } finally {
+    await prisma.$disconnect();
+  }
+});
+
+// Admin-only endpoint to create new offers
+app.post("/admin/offer-zone", authenticateToken, async (req, res) => {
+  try {
+    const admin = await prisma.admin.findUnique({
+      where: { id: String(req.user.userId) },
+    });
+
+    if (!admin) {
+      return res.status(403).json({
+        success: false,
+        message: "Unauthorized: Admin access required",
+      });
+    }
+
+    const { vendorName, discount, promoCode, description, validUntil, rating } =
+      req.body;
+
+    // Validate required fields
+    if (!vendorName || !discount || !validUntil) {
+      return res.status(400).json({
+        success: false,
+        message: "Vendor name, discount, and valid until date are required",
+      });
+    }
+
+    const newOffer = await prisma.offerZone.create({
+      data: {
+        vendorName,
+        discount,
+        promoCode: promoCode || null,
+        category: "General",
+        description: description || "",
+        validUntil,
+        rating: rating ? parseFloat(rating) : 0.0,
+        isActive: true,
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Offer created successfully",
+      data: newOffer,
+    });
+  } catch (error) {
+    console.error("Error creating offer:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while creating offer",
+    });
+  }
+});
+
+// Admin-only endpoint to update offers
+app.put("/admin/offer-zone/:id", authenticateToken, async (req, res) => {
+  try {
+    // Check if user is admin
+    const admin = await prisma.admin.findUnique({
+      where: { id: String(req.user.userId) },
+    });
+
+    if (!admin) {
+      return res.status(403).json({
+        success: false,
+        message: "Unauthorized: Admin access required",
+      });
+    }
+
+    const offerId = parseInt(req.params.id);
+    if (isNaN(offerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid offer ID",
+      });
+    }
+
+    const {
+      vendorName,
+      discount,
+      promoCode,
+      description,
+      validUntil,
+      rating,
+      isActive,
+    } = req.body;
+
+    // Check if offer exists
+    const existingOffer = await prisma.offerZone.findUnique({
+      where: { id: offerId },
+    });
+
+    if (!existingOffer) {
+      return res.status(404).json({
+        success: false,
+        message: "Offer not found",
+      });
+    }
+
+    const updatedOffer = await prisma.offerZone.update({
+      where: { id: offerId },
+      data: {
+        vendorName: vendorName || existingOffer.vendorName,
+        discount: discount || existingOffer.discount,
+        promoCode:
+          promoCode !== undefined ? promoCode : existingOffer.promoCode,
+        category: existingOffer.category,
+        description: description || existingOffer.description,
+        validUntil: validUntil || existingOffer.validUntil,
+        rating:
+          rating !== undefined ? parseFloat(rating) : existingOffer.rating,
+        isActive:
+          isActive !== undefined ? Boolean(isActive) : existingOffer.isActive,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Offer updated successfully",
+      data: updatedOffer,
+    });
+  } catch (error) {
+    console.error("Error updating offer:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while updating offer",
+    });
+  }
+});
+
+// Admin-only endpoint to delete offers
+app.delete("/admin/offer-zone/:id", authenticateToken, async (req, res) => {
+  try {
+    // Check if user is admin
+    const admin = await prisma.admin.findUnique({
+      where: { id: String(req.user.userId) },
+    });
+
+    if (!admin) {
+      return res.status(403).json({
+        success: false,
+        message: "Unauthorized: Admin access required",
+      });
+    }
+
+    const offerId = parseInt(req.params.id);
+    if (isNaN(offerId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid offer ID",
+      });
+    }
+
+    // Check if offer exists
+    const existingOffer = await prisma.offerZone.findUnique({
+      where: { id: offerId },
+    });
+
+    if (!existingOffer) {
+      return res.status(404).json({
+        success: false,
+        message: "Offer not found",
+      });
+    }
+
+    // Soft delete (set isActive to false) or hard delete:
+    // Option 1: Soft delete
+    // await prisma.offerZone.update({
+    //   where: { id: String(offerId) },
+    //   data: {
+    //     isActive: false,
+    //     updatedAt: new Date(),
+    //   },
+    // });
+
+    // Option 2: Hard delete
+    await prisma.offerZone.delete({
+      where: { id: offerId },
+    });
+
+    res.status(200).json({
+      success: true,
+      message: "Offer deleted successfully",
+    });
+  } catch (error) {
+    console.error("Error deleting offer:", error);
+    res.status(500).json({
+      success: false,
+      message: "Internal server error while deleting offer",
+    });
+  }
+});
 
 app.listen(3001, () => {
   console.log(3001);
