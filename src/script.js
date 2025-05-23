@@ -2139,6 +2139,7 @@ app.get("/offer-zone", authenticateToken, async (req, res) => {
         vendorName: true,
         discount: true,
         promoCode: true,
+        link: true,
         description: true,
         validUntil: true,
         rating: true,
@@ -2146,7 +2147,7 @@ app.get("/offer-zone", authenticateToken, async (req, res) => {
     });
 
     if (offers.length === 0) {
-      return res.status(404).json({
+      return res.status(200).json({
         success: false,
         message: "No active offers found",
         data: [],
@@ -2183,8 +2184,15 @@ app.post("/admin/offer-zone", authenticateToken, async (req, res) => {
       });
     }
 
-    const { vendorName, discount, promoCode, description, validUntil, rating } =
-      req.body;
+    const {
+      vendorName,
+      discount,
+      promoCode,
+      description,
+      link,
+      validUntil,
+      rating,
+    } = req.body;
 
     // Validate required fields
     if (!vendorName || !discount || !validUntil) {
@@ -2201,6 +2209,7 @@ app.post("/admin/offer-zone", authenticateToken, async (req, res) => {
         promoCode: promoCode || null,
         category: "General",
         description: description || "",
+        link: link || "",
         validUntil,
         rating: rating ? parseFloat(rating) : 0.0,
         isActive: true,
@@ -2249,6 +2258,7 @@ app.put("/admin/offer-zone/:id", authenticateToken, async (req, res) => {
       discount,
       promoCode,
       description,
+      link,
       validUntil,
       rating,
       isActive,
@@ -2276,6 +2286,7 @@ app.put("/admin/offer-zone/:id", authenticateToken, async (req, res) => {
         category: existingOffer.category,
         description: description || existingOffer.description,
         validUntil: validUntil || existingOffer.validUntil,
+        link: link || existingOffer.link,
         rating:
           rating !== undefined ? parseFloat(rating) : existingOffer.rating,
         isActive:

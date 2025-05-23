@@ -214,6 +214,7 @@ model OfferZone {
   category     String
   description  String
   validUntil   String
+  link         String?
   rating       Float
   isActive     Boolean   @default(true)
   createdAt    DateTime  @default(now())
