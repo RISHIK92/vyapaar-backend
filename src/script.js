@@ -6,6 +6,8 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import dotenv from "dotenv";
 import cron from "node-cron";
+import { uploadFileToS3, deleteFileFromS3 } from "./utils/upload.js";
+import multer from "multer";
 
 dotenv.config();
 
@@ -70,6 +72,20 @@ const cleanupRejectedListings = async () => {
     console.error("Error cleaning up rejected listings:", error);
   }
 };
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB limit
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith("image/")) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only image files are allowed!"));
+    }
+  },
+});
 
 // Schedule cleanup job to run every hour and at 3am daily
 setInterval(cleanupRejectedListings, 60 * 60 * 1000);
@@ -2426,6 +2442,150 @@ app.delete("/admin/offer-zone/:id", authenticateToken, async (req, res) => {
       success: false,
       message: "Internal server error while deleting offer",
     });
+  }
+});
+
+// Get all active banners
+app.get("/home-banner", async (req, res) => {
+  try {
+    const banners = await prisma.banner.findMany({
+      where: { active: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+// Get banner by ID (protected)
+app.get("/home-banner/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const banner = await prisma.banner.findUnique({
+      where: { id: Number(id) },
+    });
+
+    if (!banner) {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+
+    res.json(banner);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banner" });
+  }
+});
+
+app.post("/home-banner", authenticateToken, async (req, res) => {
+  try {
+    const { Image, ListingUrl, active = true } = req.body;
+
+    if (!Image) {
+      return res.status(400).json({ error: "Image is required" });
+    }
+
+    const newBanner = await prisma.banner.create({
+      data: {
+        Image,
+        ListingUrl,
+        active,
+      },
+    });
+
+    res.status(201).json(newBanner);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to create banner" });
+  }
+});
+
+app.post(
+  "/home-banner/upload",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "Image file is required" });
+      }
+
+      // Upload image to S3
+      const uploadResult = await uploadFileToS3(req.file);
+
+      // Create banner record in database
+      const { ListingUrl, active = true } = req.body;
+
+      const newBanner = await prisma.banner.create({
+        data: {
+          Image: uploadResult.url,
+          ListingUrl,
+          active,
+        },
+      });
+
+      res.status(201).json(newBanner);
+    } catch (error) {
+      console.error("Upload error:", error);
+      res.status(500).json({
+        error: "Failed to upload banner",
+        details: error.message,
+      });
+    }
+  }
+);
+
+// Update banner (protected)
+app.put("/home-banner/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { Image, ListingUrl, active } = req.body;
+
+    const updatedBanner = await prisma.banner.update({
+      where: { id: Number(id) },
+      data: {
+        Image,
+        ListingUrl,
+        active,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.json(updatedBanner);
+  } catch (error) {
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to update banner" });
+  }
+});
+
+app.delete("/home-banner/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const banner = await prisma.banner.findUnique({
+      where: { id: Number(id) },
+    });
+
+    if (!banner) {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+
+    const url = new URL(banner.Image);
+    const fileKey = url.pathname.substring(1);
+
+    await deleteFileFromS3(fileKey);
+
+    await prisma.banner.delete({
+      where: { id: Number(id) },
+    });
+
+    res.status(204).end();
+  } catch (error) {
+    console.error("Delete error:", error);
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to delete banner" });
   }
 });
 

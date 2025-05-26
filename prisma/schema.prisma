@@ -122,6 +122,15 @@ model Promotion {
   @@index([endDate])
 }
 
+model Banner {
+  id          Int        @id @default(autoincrement())
+  Image       String
+  ListingUrl  String?
+  active      Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @default(now())
+}
+
 model SubscriptionPlan {
   id            String      @id @default(uuid())
   name          String

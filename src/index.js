@@ -1283,6 +1283,18 @@ app.post("/listings/:id/promote", authenticateToken, async (req, res) => {
   }
 });
 
+app.get("/home-banner", async (req, res) => {
+  try {
+    const banners = await prisma.banner.findMany({
+      where: { active: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
 app.get("/banners", async (req, res) => {
   try {
     const currentDate = new Date();
