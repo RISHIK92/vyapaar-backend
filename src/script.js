@@ -1382,96 +1382,153 @@ app.delete(
   }
 );
 
+app.post("/admin/users/register", async (req, res) => {
+  try {
+    const {
+      firstName,
+      lastName,
+      email,
+      phone,
+      city,
+      password,
+      confirmPassword,
+    } = req.body;
+
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ message: "Email and password are required" });
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({ message: "Passwords do not match" });
+    }
+
+    const existingUser = await prisma.user.findUnique({ where: { email } });
+
+    if (existingUser) {
+      return res
+        .status(400)
+        .json({ message: "User already exists with this email" });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const newUser = await prisma.user.create({
+      data: {
+        email,
+        password: hashedPassword,
+        firstName,
+        lastName,
+        phone,
+        city,
+      },
+    });
+
+    const token = jwt.sign({ userId: newUser.id }, process.env.JWT_SECRET, {
+      expiresIn: "7d",
+    });
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.sameSite,
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    const { password: _, ...userData } = newUser;
+    res.status(201).json({
+      message: "User registered successfully",
+      user: userData,
+    });
+  } catch (error) {
+    console.error("Registration error:", error);
+    res.status(500).json({ message: "Server error during registration" });
+  }
+});
+
 // Admin User Management
-app.get(
-  "/admin/users",
-  authenticateAdmin(["MANAGE_USERS"]),
-  async (req, res) => {
-    try {
-      const { page = 1, limit = 20, search } = req.query;
+app.get("/admin/users", authenticateToken, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, search } = req.query;
 
-      const where = {};
-      if (search) {
-        where.OR = [
-          { email: { contains: search, mode: "insensitive" } },
-          { firstName: { contains: search, mode: "insensitive" } },
-          { lastName: { contains: search, mode: "insensitive" } },
-        ];
-      }
+    const where = {};
+    if (search) {
+      where.OR = [
+        { email: { contains: search, mode: "insensitive" } },
+        { firstName: { contains: search, mode: "insensitive" } },
+        { lastName: { contains: search, mode: "insensitive" } },
+      ];
+    }
 
-      const users = await prisma.user.findMany({
-        where,
-        select: {
-          id: true,
-          email: true,
-          firstName: true,
-          lastName: true,
-          phone: true,
-          city: true,
-          createdAt: true,
-          _count: {
-            select: { listings: true, favorites: true },
-          },
+    const users = await prisma.user.findMany({
+      where,
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        phone: true,
+        city: true,
+        createdAt: true,
+        _count: {
+          select: { listings: true, favorites: true },
         },
-        skip: (parseInt(page) - 1) * parseInt(limit),
-        take: parseInt(limit),
-        orderBy: { createdAt: "desc" },
-      });
+      },
+      skip: (parseInt(page) - 1) * parseInt(limit),
+      take: parseInt(limit),
+      orderBy: { createdAt: "desc" },
+    });
 
-      const total = await prisma.user.count({ where });
+    const total = await prisma.user.count({ where });
 
-      res.json({
-        users,
-        total,
-        page: parseInt(page),
-        totalPages: Math.ceil(total / parseInt(limit)),
-      });
-    } catch (error) {
-      console.error("Admin users error:", error);
-      res.status(500).json({ message: "Error fetching users" });
-    }
+    res.json({
+      users,
+      total,
+      page: parseInt(page),
+      totalPages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (error) {
+    console.error("Admin users error:", error);
+    res.status(500).json({ message: "Error fetching users" });
   }
-);
+});
 
-app.delete(
-  "/admin/users/:id",
-  authenticateAdmin(["MANAGE_USERS"]),
-  async (req, res) => {
-    try {
-      const { id } = req.params;
+app.delete("/admin/users/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-      // First delete user's listings and related data
-      const listings = await prisma.listing.findMany({
-        where: { userId: parseInt(id) },
-        select: { id: true },
-      });
+    // First delete user's listings and related data
+    const listings = await prisma.listing.findMany({
+      where: { userId: parseInt(id) },
+      select: { id: true },
+    });
 
-      const listingIds = listings.map((l) => l.id);
+    const listingIds = listings.map((l) => l.id);
 
-      await prisma.promotion.deleteMany({
-        where: { listingId: { in: listingIds } },
-      });
-      await prisma.image.deleteMany({
-        where: { listingId: { in: listingIds } },
-      });
-      await prisma.favorite.deleteMany({
-        where: { listingId: { in: listingIds } },
-      });
-      await prisma.adminApproval.deleteMany({
-        where: { listingId: { in: listingIds } },
-      });
-      await prisma.listing.deleteMany({ where: { userId: id } });
+    await prisma.promotion.deleteMany({
+      where: { listingId: { in: listingIds } },
+    });
+    await prisma.image.deleteMany({
+      where: { listingId: { in: listingIds } },
+    });
+    await prisma.favorite.deleteMany({
+      where: { listingId: { in: listingIds } },
+    });
+    await prisma.adminApproval.deleteMany({
+      where: { listingId: { in: listingIds } },
+    });
+    await prisma.listing.deleteMany({ where: { userId: parseInt(id) } });
 
-      // Then delete the user
-      await prisma.user.delete({ where: { id } });
+    // Then delete the user
+    await prisma.user.delete({ where: { id: parseInt(id) } });
 
-      res.json({ message: "User and all related data deleted successfully" });
-    } catch (error) {
-      console.error("Delete user error:", error);
-      res.status(500).json({ message: "Error deleting user" });
-    }
+    res.json({ message: "User and all related data deleted successfully" });
+  } catch (error) {
+    console.error("Delete user error:", error);
+    res.status(500).json({ message: "Error deleting user" });
   }
-);
+});
 
 // Pricing Plan Management
 app.get("/admin/pricing-plans", authenticateAdmin(), async (req, res) => {
