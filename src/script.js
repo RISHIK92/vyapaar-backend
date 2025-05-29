@@ -820,7 +820,7 @@ app.put("/listings/:id", authenticateToken, async (req, res) => {
   }
 });
 
-app.delete("/listings/:id", authenticateToken, async (req, res) => {
+app.delete("/admin/listings/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -839,13 +839,16 @@ app.delete("/listings/:id", authenticateToken, async (req, res) => {
     }
 
     // Delete related records
-    await prisma.promotion.deleteMany({ where: { listingId: id } });
-    await prisma.image.deleteMany({ where: { listingId: id } });
-    await prisma.favorite.deleteMany({ where: { listingId: id } });
-    await prisma.adminApproval.deleteMany({ where: { listingId: id } });
+    await prisma.promotion.deleteMany({ where: { listingId: parseInt(id) } });
+    await prisma.image.deleteMany({ where: { listingId: parseInt(id) } });
+    await prisma.favorite.deleteMany({ where: { listingId: parseInt(id) } });
+    await prisma.payment.deleteMany({ where: { listingId: parseInt(id) } });
+    await prisma.adminApproval.deleteMany({
+      where: { listingId: parseInt(id) },
+    });
 
     // Delete the listing
-    await prisma.listing.delete({ where: { id } });
+    await prisma.listing.delete({ where: { id: parseInt(id) } });
 
     res.json({ message: "Listing deleted successfully" });
   } catch (error) {
@@ -1371,7 +1374,7 @@ app.put(
 );
 
 app.delete(
-  "/admin/listings/:id",
+  "/listings/:id",
   authenticateAdmin(["DELETE_LISTINGS"]),
   async (req, res) => {
     try {
@@ -2586,6 +2589,138 @@ app.delete("/home-banner/:id", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Banner not found" });
     }
     res.status(500).json({ error: "Failed to delete banner" });
+  }
+});
+
+app.get("/admin/payment", authenticateToken, async (req, res) => {
+  try {
+    // Get all payments for listings owned by the authenticated user
+    const payments = await prisma.payment.findMany({
+      include: {
+        listing: {
+          select: {
+            title: true,
+            status: true,
+            listingTier: true,
+            subscription: {
+              select: {
+                name: true,
+                durationDays: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    });
+
+    if (!payments || payments.length === 0) {
+      return res
+        .status(404)
+        .json({ message: "No payments found for this user" });
+    }
+
+    // Format the response data
+    const formattedPayments = payments.map((payment) => ({
+      id: payment.id,
+      amount: payment.amount,
+      currency: payment.currency,
+      paymentMethod: payment.paymentMethod,
+      status: payment.status,
+      transactionId: payment.transactionId,
+      createdAt: payment.createdAt,
+      listing: {
+        id: payment.listingId,
+        title: payment.listing.title,
+        status: payment.listing.status,
+        tier: payment.listing.listingTier,
+        subscription: payment.listing.subscription,
+      },
+    }));
+
+    res.json({
+      success: true,
+      data: formattedPayments,
+    });
+  } catch (error) {
+    console.error("Payment fetch error:", error);
+    res.status(500).json({
+      success: false,
+      error: "Failed to fetch payment history",
+      details: error.message,
+    });
+  }
+});
+
+// GET /admin/pages - List all pages
+app.get("/admin/pages", authenticateToken, async (req, res) => {
+  try {
+    const pages = await prisma.page.findMany({
+      orderBy: { updatedAt: "desc" },
+    });
+    res.json(pages);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch pages" });
+  }
+});
+
+// POST /admin/pages - Create new page
+app.post("/admin/pages", authenticateToken, async (req, res) => {
+  const { title, slug, content } = req.body;
+
+  try {
+    // Check if page with this slug already exists
+    const existingPage = await prisma.page.findUnique({
+      where: { slug },
+    });
+
+    if (existingPage) {
+      return res
+        .status(400)
+        .json({ error: "Page with this slug already exists" });
+    }
+
+    const newPage = await prisma.page.create({
+      data: { title, slug, content },
+    });
+
+    res.json(newPage);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to create page" });
+  }
+});
+
+// PUT /admin/pages/:id - Update page
+app.put("/admin/pages/:id", authenticateToken, async (req, res) => {
+  const { id } = req.params;
+  const { title, content } = req.body;
+
+  try {
+    const updatedPage = await prisma.page.update({
+      where: { id },
+      data: { title, content },
+    });
+
+    res.json(updatedPage);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to update page" });
+  }
+});
+
+// DELETE /admin/pages/:id - Delete page
+app.delete("/admin/pages/:id", authenticateToken, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await prisma.page.delete({
+      where: { id },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to delete page" });
   }
 });
 

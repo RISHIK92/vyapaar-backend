@@ -1295,6 +1295,34 @@ app.get("/home-banner", async (req, res) => {
   }
 });
 
+app.get("/pages", async (req, res) => {
+  try {
+    const pages = await prisma.page.findMany({
+      orderBy: { updatedAt: "desc" },
+    });
+    res.json(pages);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch pages" });
+  }
+});
+
+app.get("/pages/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    const page = await prisma.page.findUnique({
+      where: { slug },
+    });
+
+    if (!page) {
+      return res.status(404).json({ error: "Page not found" });
+    }
+
+    res.json(page);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch page" });
+  }
+});
+
 app.get("/banners", async (req, res) => {
   try {
     const currentDate = new Date();
