@@ -1000,6 +1000,23 @@ app.get("/categories", async (req, res) => {
   }
 });
 
+app.get("/admin/cities", authenticateToken, async (req, res) => {
+  try {
+    const cities = await prisma.city.findMany({
+      include: {
+        _count: {
+          select: { listings: { where: { status: "APPROVED" } } },
+        },
+      },
+    });
+
+    res.json(cities);
+  } catch (error) {
+    console.error("Get cities error:", error);
+    res.status(500).json({ message: "Error fetching cities" });
+  }
+});
+
 // Message Routes
 app.get("/messages", authenticateToken, async (req, res) => {
   try {
@@ -1687,6 +1704,34 @@ app.post(
   }
 );
 
+app.post(
+  "/admin/cities",
+  authenticateAdmin(["MANAGE_CATEGORIES"]),
+  async (req, res) => {
+    try {
+      const { name } = req.body;
+
+      if (!name) {
+        return res.status(400).json({ message: "City name is required" });
+      }
+
+      // Convert name to uppercase
+      const uppercaseName = name.toUpperCase();
+
+      const city = await prisma.city.create({
+        data: {
+          name: uppercaseName,
+        },
+      });
+
+      res.status(201).json(city);
+    } catch (error) {
+      console.error("Create city error:", error);
+      res.status(500).json({ message: "Error creating city" });
+    }
+  }
+);
+
 app.put(
   "/admin/categories/:id",
   authenticateAdmin(["MANAGE_CATEGORIES"]),
@@ -1702,13 +1747,42 @@ app.put(
       const uppercaseName = name.toUpperCase();
 
       const category = await prisma.category.update({
-        where: { id: parseInt(id) },
+        where: { id: id },
         data: {
           name: uppercaseName,
         },
       });
 
       res.json(category);
+    } catch (error) {
+      console.error("Update category error:", error);
+      res.status(500).json({ message: "Error updating category" });
+    }
+  }
+);
+
+app.put(
+  "/admin/cities/:id",
+  authenticateAdmin(["MANAGE_CATEGORIES"]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { name } = req.body;
+
+      if (!name) {
+        return res.status(400).json({ message: "City name is required" });
+      }
+
+      const uppercaseName = name.toUpperCase();
+
+      const city = await prisma.city.update({
+        where: { id: id },
+        data: {
+          name: uppercaseName,
+        },
+      });
+
+      res.json(city);
     } catch (error) {
       console.error("Update category error:", error);
       res.status(500).json({ message: "Error updating category" });
@@ -1725,7 +1799,7 @@ app.delete(
 
       // Check if category has listings
       const listingsCount = await prisma.listing.count({
-        where: { categoryId: parseInt(id) },
+        where: { categoryId: id },
       });
 
       if (listingsCount > 0) {
@@ -1736,6 +1810,35 @@ app.delete(
       }
 
       await prisma.category.delete({ where: { id } });
+
+      res.json({ message: "Category deleted successfully" });
+    } catch (error) {
+      console.error("Delete category error:", error);
+      res.status(500).json({ message: "Error deleting category" });
+    }
+  }
+);
+
+app.delete(
+  "/admin/cities/:id",
+  authenticateAdmin(["MANAGE_CATEGORIES"]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      // Check if category has listings
+      const listingsCount = await prisma.listing.count({
+        where: { cityId: id },
+      });
+
+      if (listingsCount > 0) {
+        return res.status(400).json({
+          message: "Cannot delete category with active listings",
+          listingsCount,
+        });
+      }
+
+      await prisma.city.delete({ where: { id } });
 
       res.json({ message: "Category deleted successfully" });
     } catch (error) {
