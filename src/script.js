@@ -2445,7 +2445,7 @@ app.put(
   }
 );
 
-app.get("/offer-zone", authenticateToken, async (req, res) => {
+app.get("/admin/offer-zone", authenticateToken, async (req, res) => {
   try {
     const currentDate = new Date().toISOString().split("T")[0];
 
