@@ -8,6 +8,7 @@ import dotenv from "dotenv";
 import cron from "node-cron";
 import { uploadFileToS3, deleteFileFromS3 } from "./utils/upload.js";
 import multer from "multer";
+import homeRouter from "./routes/homeCategories.js";
 
 dotenv.config();
 
@@ -24,6 +25,7 @@ app.use(
     credentials: true,
   })
 );
+app.use("/home-categories", homeRouter);
 
 // Helper Functions
 const generateSlug = () => {
@@ -988,7 +990,6 @@ app.get("/categories", async (req, res) => {
         _count: {
           select: { listings: { where: { status: "APPROVED" } } },
         },
-        orderBy: { name: "asc" },
       },
     });
 
@@ -2091,6 +2092,141 @@ app.get("/admin/check-auth", authenticateAdmin(), (req, res) => {
   });
 });
 
+app.put(
+  "/admin/listings/:id/change-tier",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { newTier } = req.body;
+
+      // Validate the new tier
+      if (!["FREE", "PREMIUM", "PREMIUM_PLUS"].includes(newTier)) {
+        return res.status(400).json({ error: "Invalid listing tier" });
+      }
+
+      // Find the listing with its current subscription
+      const listing = await prisma.listing.findUnique({
+        where: { id: parseInt(id) },
+        include: {
+          subscription: true,
+          promotions: {
+            where: { isActive: true },
+            take: 1,
+          },
+        },
+      });
+
+      if (!listing) {
+        return res.status(404).json({ error: "Listing not found" });
+      }
+
+      // Calculate new expiration date based on tier change
+      let expiresAt = listing.expiresAt;
+      const now = new Date();
+
+      if (newTier !== "FREE") {
+        // Find the standard subscription for the new tier
+        const subscriptionPlan = await prisma.subscriptionPlan.findFirst({
+          where: {
+            tierType: newTier,
+            isActive: true,
+          },
+          orderBy: { createdAt: "desc" },
+        });
+
+        if (subscriptionPlan) {
+          // If listing was FREE, set new expiration from now
+          if (listing.listingTier === "FREE") {
+            expiresAt = new Date();
+            expiresAt.setDate(
+              expiresAt.getDate() + subscriptionPlan.durationDays
+            );
+          } else {
+            expiresAt = new Date(Math.max(now, new Date(listing.expiresAt)));
+            expiresAt.setDate(
+              expiresAt.getDate() + subscriptionPlan.durationDays
+            );
+          }
+        }
+      } else {
+        expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + 30);
+      }
+
+      // Prepare data for update
+      const updateData = {
+        listingTier: newTier,
+        expiresAt,
+        // If changing to FREE, remove subscription
+        subscription: newTier === "FREE" ? { disconnect: true } : undefined,
+      };
+
+      // Update the listing
+      const updatedListing = await prisma.listing.update({
+        where: { id: parseInt(id) },
+        data: updateData,
+        include: {
+          user: true,
+          category: true,
+          city: true,
+          images: true,
+          subscription: true,
+        },
+      });
+
+      // Handle promotion changes
+      if (listing.promotions.length > 0) {
+        if (newTier === "FREE") {
+          // Disable active promotion if changing to FREE
+          await prisma.promotion.updateMany({
+            where: {
+              listingId: parseInt(id),
+              isActive: true,
+            },
+            data: { isActive: false },
+          });
+        }
+      }
+
+      // Handle promotion activation when upgrading from FREE to paid tier
+      if (listing.listingTier === "FREE" && newTier !== "FREE") {
+        // Find the subscription plan for the new tier
+        const subscriptionPlan = await prisma.subscriptionPlan.findFirst({
+          where: {
+            tierType: newTier,
+            isActive: true,
+          },
+          orderBy: { createdAt: "desc" },
+        });
+
+        if (subscriptionPlan && subscriptionPlan.promotionDays > 0) {
+          // Create a new promotion when upgrading from FREE to paid tier
+          const startDate = new Date();
+          const endDate = new Date();
+          endDate.setDate(startDate.getDate() + subscriptionPlan.promotionDays);
+
+          await prisma.promotion.create({
+            data: {
+              listingId: parseInt(id),
+              price: 0, // Assuming admin-initiated promotions are free
+              startDate,
+              endDate,
+              durationDays: subscriptionPlan.promotionDays,
+              isActive: true,
+            },
+          });
+        }
+      }
+
+      res.json(updatedListing);
+    } catch (error) {
+      console.error("Error changing listing tier:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  }
+);
+
 app.get("/subscription-plans", async (req, res) => {
   try {
     const plans = await prisma.subscriptionPlan.findMany({
@@ -2136,13 +2272,15 @@ app.post("/admin/subscription-plans", authenticateToken, async (req, res) => {
       return res.status(403).json({ error: "Unauthorized" });
     }
 
-    const { name, description, durationDays, price, tierType } = req.body;
+    const { name, description, durationDays, promotionDays, price, tierType } =
+      req.body;
 
     const newPlan = await prisma.subscriptionPlan.create({
       data: {
         name,
         description,
         durationDays: parseInt(durationDays),
+        promotionDays: parseInt(promotionDays),
         price: parseFloat(price),
         tierType,
         adminId: admin.id,
@@ -2172,8 +2310,15 @@ app.put(
       }
 
       const { id } = req.params;
-      const { name, description, durationDays, price, tierType, isActive } =
-        req.body;
+      const {
+        name,
+        description,
+        durationDays,
+        promotionDays,
+        price,
+        tierType,
+        isActive,
+      } = req.body;
 
       const updatedPlan = await prisma.subscriptionPlan.update({
         where: { id },
@@ -2181,6 +2326,7 @@ app.put(
           name,
           description,
           durationDays: durationDays ? parseInt(durationDays) : undefined,
+          promotionDays: promotionDays ? parseInt(promotionDays) : undefined,
           price: price ? parseFloat(price) : undefined,
           tierType,
           isActive,
@@ -2566,6 +2712,149 @@ app.delete("/home-banner/:id", authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     const banner = await prisma.banner.findUnique({
+      where: { id: Number(id) },
+    });
+
+    if (!banner) {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+
+    const url = new URL(banner.Image);
+    const fileKey = url.pathname.substring(1);
+
+    await deleteFileFromS3(fileKey);
+
+    await prisma.banner.delete({
+      where: { id: Number(id) },
+    });
+
+    res.status(204).end();
+  } catch (error) {
+    console.error("Delete error:", error);
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to delete banner" });
+  }
+});
+
+app.get("/admin-banners", async (req, res) => {
+  try {
+    const banners = await prisma.adminBanner.findMany({
+      where: { active: true },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+// Get banner by ID (protected)
+app.get("/admin-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const banner = await prisma.adminBanner.findUnique({
+      where: { id: Number(id) },
+    });
+
+    if (!banner) {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+
+    res.json(banner);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banner" });
+  }
+});
+
+app.post("/admin-banners", authenticateToken, async (req, res) => {
+  try {
+    const { Image, ListingUrl, active = true } = req.body;
+
+    if (!Image) {
+      return res.status(400).json({ error: "Image is required" });
+    }
+
+    const newBanner = await prisma.adminBanner.create({
+      data: {
+        Image,
+        ListingUrl,
+        active,
+      },
+    });
+
+    res.status(201).json(newBanner);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to create banner" });
+  }
+});
+
+app.post(
+  "/admin-banners/upload",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "Image file is required" });
+      }
+
+      // Upload image to S3
+      const uploadResult = await uploadFileToS3(req.file);
+
+      // Create banner record in database
+      const { ListingUrl, active = true } = req.body;
+
+      const newBanner = await prisma.adminBanner.create({
+        data: {
+          Image: uploadResult.url,
+          ListingUrl,
+          active,
+        },
+      });
+
+      res.status(201).json(newBanner);
+    } catch (error) {
+      console.error("Upload error:", error);
+      res.status(500).json({
+        error: "Failed to upload banner",
+        details: error.message,
+      });
+    }
+  }
+);
+
+// Update banner (protected)
+app.put("/admin-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { Image, ListingUrl, active } = req.body;
+
+    const updatedBanner = await prisma.adminBanner.update({
+      where: { id: Number(id) },
+      data: {
+        Image,
+        ListingUrl,
+        active,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.json(updatedBanner);
+  } catch (error) {
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to update banner" });
+  }
+});
+
+app.delete("/admin-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const banner = await prisma.adminBanner.findUnique({
       where: { id: Number(id) },
     });
 

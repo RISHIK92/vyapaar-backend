@@ -21,6 +21,8 @@ model User {
   listings        Listing[]
   RecieverMessage Message[]  @relation("receiverMessages")
   SenderMessage   Message[]  @relation("senderMessages")
+
+  Review Review[]
 }
 
 model Admin {
@@ -41,6 +43,8 @@ model Category {
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   listings  Listing[]
+
+  HomeCategory HomeCategory[]
 }
 
 model City {
@@ -73,15 +77,15 @@ model Listing {
   establishedYear  Int?
   serviceArea      String?
   teamSize         String?
-  rating           Float?
-  reviewCount      Int?
+  rating           Float?            // Average rating
+  reviewCount      Int?              @default(0) // Total number of reviews
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
   expiresAt        DateTime
   isBannerEnabled  Boolean           @default(false)
   subscriptionId   String?
-  youtubeVideo     String?   // Add this line
-  locationUrl      String?   // Add this line
+  youtubeVideo     String?
+  locationUrl      String?
   serviceRadius    Int? 
   AdminApproval    AdminApproval?
   Favorite         Favorite[]
@@ -94,6 +98,40 @@ model Listing {
   Message          Message[]
   Payment          Payment[]
   promotions       Promotion[]
+  reviews          Review[]          // Added relation to reviews
+
+  HomeCategory HomeCategory[]
+}
+
+model HomeCategory {
+  id        String   @id @default(cuid())
+  name      String
+  categoryId String
+  category  Category @relation(fields: [categoryId], references: [id])
+  iconName  String
+  color     String
+  order     Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([categoryId])
+  Listing Listing[]
+}
+
+model Review {
+  id          String   @id @default(uuid())
+  title       String
+  description String
+  rating      Float    @default(5.0)
+  userId      Int
+  listingId   Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id])
+  listing     Listing  @relation(fields: [listingId], references: [id])
+
+  @@index([userId])
+  @@index([listingId])
 }
 
 model Image {
@@ -120,6 +158,15 @@ model Promotion {
   @@index([listingId])
   @@index([isActive])
   @@index([endDate])
+}
+
+model AdminBanner {
+  id          Int        @id @default(autoincrement())
+  Image       String
+  ListingUrl  String?
+  active      Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @default(now())
 }
 
 model Banner {
