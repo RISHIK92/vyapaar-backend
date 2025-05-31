@@ -2685,7 +2685,6 @@ app.delete("/admin/offer-zone/:id", authenticateToken, async (req, res) => {
 app.get("/home-banner", async (req, res) => {
   try {
     const banners = await prisma.banner.findMany({
-      where: { active: true },
       orderBy: { createdAt: "desc" },
     });
     res.json(banners);
@@ -2828,7 +2827,6 @@ app.delete("/home-banner/:id", authenticateToken, async (req, res) => {
 app.get("/admin-banners", async (req, res) => {
   try {
     const banners = await prisma.adminBanner.findMany({
-      where: { active: true },
       orderBy: { createdAt: "desc" },
     });
     res.json(banners);
