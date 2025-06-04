@@ -15,7 +15,7 @@ dotenv.config();
 
 const prisma = new PrismaClient();
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.ADMIN_PORT || 3001;
 
 // Middleware
 app.use(express.json());
@@ -3098,6 +3098,6 @@ app.delete("/admin/pages/:id", authenticateToken, async (req, res) => {
   }
 });
 
-app.listen(3001, () => {
-  console.log(3001);
+app.listen(PORT, () => {
+  console.log(PORT);
 });
