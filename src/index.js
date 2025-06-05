@@ -795,6 +795,7 @@ app.post("/listings", authenticateToken, async (req, res) => {
       reviewCount,
       listingTier = "FREE",
       subscriptionId,
+      photos, // This should be an array of { url, isBanner }
       youtubeVideo,
       locationUrl,
       serviceRadius,
@@ -888,6 +889,7 @@ app.post("/listings", authenticateToken, async (req, res) => {
       }
     }
 
+    // Create the listing first
     const newListing = await prisma.listing.create({
       data: {
         title,
@@ -928,6 +930,21 @@ app.post("/listings", authenticateToken, async (req, res) => {
         user: true,
       },
     });
+
+    // Create images if photos are provided
+    if (photos && photos.length > 0) {
+      // Find the banner index if provided
+      const bannerIndex = photos.findIndex((photo) => photo.isBanner);
+
+      await prisma.image.createMany({
+        data: photos.map((photo, index) => ({
+          url: photo.url,
+          isPrimary: index === 0, // First image is always primary/featured
+          isBanner: index === bannerIndex,
+          listingId: newListing.id,
+        })),
+      });
+    }
 
     // Create promotion if applicable
     if (subscriptionPlan && subscriptionPlan.promotionDays > 0) {

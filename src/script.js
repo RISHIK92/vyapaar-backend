@@ -2201,6 +2201,7 @@ app.put(
             where: { isActive: true },
             take: 1,
           },
+          images: true,
         },
       });
 
@@ -2211,6 +2212,15 @@ app.put(
       // Calculate new expiration date based on tier change
       let expiresAt = listing.expiresAt;
       const now = new Date();
+
+      // Determine if banner should be enabled
+      let isBannerEnabled = listing.isBannerEnabled;
+
+      if (newTier === "FREE") {
+        isBannerEnabled = false; // Disable banner for FREE tier
+      } else {
+        isBannerEnabled = true; // Enable banner for PREMIUM and PREMIUM_PLUS
+      }
 
       if (newTier !== "FREE") {
         // Find the standard subscription for the new tier
@@ -2245,6 +2255,7 @@ app.put(
       const updateData = {
         listingTier: newTier,
         expiresAt,
+        isBannerEnabled,
         // If changing to FREE, remove subscription
         subscription: newTier === "FREE" ? { disconnect: true } : undefined,
       };

@@ -18,6 +18,7 @@ const s3Client = new S3Client({
 });
 
 const bucketName = process.env.AWS_S3_BUCKET_NAME;
+const cloudfrontDomain = process.env.CLOUDFRONT_DOMAIN;
 
 export const uploadFileToS3 = async (file) => {
   const ext = path.extname(file.originalname);
@@ -28,14 +29,15 @@ export const uploadFileToS3 = async (file) => {
     Key: fileName,
     Body: file.buffer,
     ContentType: file.mimetype,
-    ACL: "public-read", // Make the file publicly accessible
+    // Remove ACL if your bucket policy is set correctly
+    // ACL: "public-read",
   };
 
   try {
     await s3Client.send(new PutObjectCommand(uploadParams));
 
-    // Return the URL to access the file
-    const fileUrl = `https://${bucketName}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+    // Return the CloudFront URL instead of S3 URL
+    const fileUrl = `https://${cloudfrontDomain}/${fileName}`;
 
     return {
       url: fileUrl,
@@ -48,7 +50,6 @@ export const uploadFileToS3 = async (file) => {
   }
 };
 
-// Function to delete file from S3
 export const deleteFileFromS3 = async (fileKey) => {
   const deleteParams = {
     Bucket: bucketName,
