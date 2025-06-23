@@ -12,6 +12,18 @@ import paymentRoutes from "./routes/payment.js";
 import locationRoutes from "./routes/location.js";
 import NodeCache from "node-cache";
 import axios from "axios";
+import getFilteredMiddleBanners, {
+  formatMiddleBanners,
+} from "./utils/middleBanner.js";
+import getFilteredBottomBanners, {
+  formatBottomBanners,
+} from "./utils/bottomBanner.js";
+import getFilteredHeroBanners, {
+  formatHeroBanners,
+} from "./utils/heroBanner.js";
+import getFilteredCategoryBanners, {
+  formatCategoryBanners,
+} from "./utils/categoryBanner.js";
 
 const pincodeCache = new NodeCache({ stdTTL: 86400 });
 
@@ -744,16 +756,30 @@ app.delete("/listings/:id/favorite", authenticateToken, async (req, res) => {
 app.post(
   "/upload",
   authenticateToken,
-  upload.array("photos", 5),
+  upload.array("photos", 10),
   async (req, res) => {
     try {
       if (!req.files || req.files.length === 0) {
         return res.status(400).json({ error: "No files uploaded" });
       }
 
-      const bannerIndex = parseInt(req.body.bannerIndex) || 0;
+      // Parse photo types from form data
+      const photoTypes = [];
+      for (let i = 0; i < req.files.length; i++) {
+        const typeKey = `photoTypes[${i}]`;
+        photoTypes.push(req.body[typeKey] || "gallery");
+      }
 
-      // Upload files to S3
+      // Parse metadata if available
+      let metadata = { featuredCount: 0, bannerCount: 0, galleryCount: 0 };
+      if (req.body.photoMetadata) {
+        try {
+          metadata = JSON.parse(req.body.photoMetadata);
+        } catch (e) {
+          console.warn("Failed to parse photo metadata");
+        }
+      }
+
       const uploadPromises = req.files.map((file) => uploadFileToS3(file));
       const uploadedFiles = await Promise.all(uploadPromises);
 
@@ -761,10 +787,29 @@ app.post(
         url: file.url,
         filename: file.filename,
         key: file.key,
-        isBanner: index === bannerIndex,
+        type: photoTypes[index] || "gallery",
+        isFeatured: photoTypes[index] === "featured",
+        isBanner: photoTypes[index] === "banner",
+        isGallery: photoTypes[index] === "gallery",
+        order: index,
       }));
 
-      res.status(200).json({ urls });
+      const organizedUrls = {
+        featured: urls.filter((img) => img.type === "featured"),
+        banner: urls.filter((img) => img.type === "banner"),
+        gallery: urls.filter((img) => img.type === "gallery"),
+        all: urls,
+      };
+
+      res.status(200).json({
+        urls: urls,
+        organized: organizedUrls,
+        metadata: {
+          ...metadata,
+          totalUploaded: urls.length,
+          uploadedAt: new Date().toISOString(),
+        },
+      });
     } catch (error) {
       console.error("Upload error:", error);
       res.status(500).json({ error: "Failed to upload files" });
@@ -807,7 +852,6 @@ app.post("/listings", authenticateToken, async (req, res) => {
       });
     }
 
-    // Get subscription plan details if provided
     let subscriptionPlan = null;
     if (subscriptionId) {
       subscriptionPlan = await prisma.subscriptionPlan.findUnique({
@@ -867,7 +911,6 @@ app.post("/listings", authenticateToken, async (req, res) => {
       initialStatus = "PENDING_PAYMENT";
     }
 
-    // Calculate expiration date based on tier
     let expiresAt;
     let isBannerEnabled = false;
 
@@ -889,7 +932,6 @@ app.post("/listings", authenticateToken, async (req, res) => {
       }
     }
 
-    // Create the listing first
     const newListing = await prisma.listing.create({
       data: {
         title,
@@ -931,15 +973,13 @@ app.post("/listings", authenticateToken, async (req, res) => {
       },
     });
 
-    // Create images if photos are provided
     if (photos && photos.length > 0) {
-      // Find the banner index if provided
       const bannerIndex = photos.findIndex((photo) => photo.isBanner);
 
       await prisma.image.createMany({
         data: photos.map((photo, index) => ({
           url: photo.url,
-          isPrimary: index === 0, // First image is always primary/featured
+          isPrimary: index === 0,
           isBanner: index === bannerIndex,
           listingId: newListing.id,
         })),
@@ -1140,86 +1180,14 @@ app.post("/cities", authenticateToken, async (req, res) => {
 
 app.get("/listings/random", async (req, res) => {
   try {
-    const { pincode } = req.query;
+    const { pincode, limit } = req.query;
+    const maxResults = parseInt(limit) || 6;
 
-    if (!pincode) {
-      // Fallback to original random sampling if no pincode provided
-      const total = await prisma.listing.count({
-        where: { status: "APPROVED" },
-      });
-      const skip = Math.floor(Math.random() * Math.max(0, total - 6));
-
-      const listings = await prisma.listing.findMany({
-        where: { status: "APPROVED" },
-        include: {
-          category: true,
-          images: {
-            where: { isPrimary: true },
-            take: 1,
-          },
-        },
-        take: 6,
-        skip: skip,
-        orderBy: { createdAt: "desc" },
-      });
-
-      return res.json(formatListings(listings));
-    }
-
-    // Step 1: Convert pincode to coordinates using a geocoding API
-    const pincodeCoords = await getCoordinatesFromPincode(pincode);
-    if (!pincodeCoords) {
-      return res.status(400).json({
-        error: "Could not determine location for the provided pincode",
-      });
-    }
-
-    // Step 2: Get all approved listings with their location data
-    const allListings = await prisma.listing.findMany({
-      where: { status: "APPROVED" },
-      include: {
-        category: true,
-        images: {
-          where: { isPrimary: true },
-          take: 1,
-        },
-      },
-    });
-
-    // Step 3: Calculate distance for each listing and sort by nearest
-    const listingsWithDistance = await Promise.all(
-      allListings.map(async (listing) => {
-        try {
-          // Get coordinates from listing's location data (could be address, pincode, etc.)
-          const listingCoords = await getCoordinatesFromListing(listing);
-          if (!listingCoords) {
-            return { ...listing, distance: Infinity };
-          }
-
-          const distance = calculateDistance(
-            pincodeCoords.lat,
-            pincodeCoords.lng,
-            listingCoords.lat,
-            listingCoords.lng
-          );
-
-          return { ...listing, distance };
-        } catch (error) {
-          console.error(`Error processing listing ${listing.id}:`, error);
-          return { ...listing, distance: Infinity };
-        }
-      })
-    );
-
-    // Step 4: Filter out invalid listings and get the nearest 6
-    const nearestListings = listingsWithDistance
-      .filter((listing) => listing.distance !== Infinity)
-      .sort((a, b) => a.distance - b.distance)
-      .slice(0, 6);
-
-    res.json(formatListings(nearestListings));
+    // Get filtered and scored listings using hybrid system
+    const listings = await getFilteredRandomListings(pincode, maxResults);
+    res.json(formatListings(listings));
   } catch (error) {
-    console.error("Error fetching listings:", error);
+    console.error("Error fetching random listings:", error);
     res.status(500).json({
       error: "Failed to fetch listings",
       details: error.message,
@@ -1227,59 +1195,442 @@ app.get("/listings/random", async (req, res) => {
   }
 });
 
-// Helper function to get coordinates from a listing
-async function getCoordinatesFromListing(listing) {
-  // Priority 1: If listing has a Google Maps URL, extract coords from it
-  if (listing.locationUrl) {
-    const coords = await extractCoordsFromUrl(listing.locationUrl);
-    if (coords) return coords;
+async function getFilteredRandomListings(userPincode, maxResults = 6) {
+  // Get all approved listings
+  const allListings = await getAllApprovedListings();
+
+  // If no pincode provided, return all listings randomly
+  if (!userPincode) {
+    console.log(
+      "No pincode provided - returning random listings from all available"
+    );
+    return getRandomListings(allListings, maxResults);
   }
 
-  // Priority 2: If listing has a pincode, geocode it
-  if (listing.pincode) {
-    const coords = await getCoordinatesFromPincode(listing.pincode);
-    if (coords) return coords;
+  const userLocation = await getEnhancedLocationData(userPincode);
+
+  if (!userLocation) {
+    console.log(
+      `Could not determine location for pincode: ${userPincode} - returning all listings`
+    );
+    return getRandomListings(allListings, maxResults);
   }
 
-  // Priority 3: If listing has city/address, try to geocode that
-  if (listing.city) {
-    try {
-      const response = await axios.get(
-        `https://nominatim.openstreetmap.org/search?city=${encodeURIComponent(
-          listing.city
-        )}&format=json&limit=1`
+  console.log(`User location data for ${userPincode}:`, {
+    district: userLocation.district,
+    city: userLocation.city,
+    coordinates: userLocation.coordinates,
+  });
+
+  // Categorize listings by location relevance
+  const areaListings = []; // Same district/area
+  const nearbyListings = []; // Nearby by distance
+  const fallbackListings = []; // No location data
+
+  for (const listing of allListings) {
+    const listingLocation = await getListingLocationData(listing);
+
+    // If listing has no location data, add to fallback
+    if (!listingLocation) {
+      fallbackListings.push(listing);
+      continue;
+    }
+
+    // Check if listing is in the same area (district match)
+    const isInSameArea = isListingInUserArea(userLocation, listingLocation);
+
+    if (isInSameArea) {
+      // Calculate score for sorting within area
+      const score = calculateListingLocationScore(
+        userLocation,
+        listingLocation,
+        listing
       );
-      if (response.data && response.data.length > 0) {
-        return {
-          lat: parseFloat(response.data[0].lat),
-          lng: parseFloat(response.data[0].lon),
-        };
+      areaListings.push({ ...listing, locationScore: score });
+    } else {
+      // Calculate distance for nearby listings
+      console.log(userLocation.coordinates, listingLocation.coordinates);
+      if (userLocation.coordinates && listingLocation.coordinates) {
+        const distance = calculateDistance(
+          userLocation.coordinates.lat,
+          userLocation.coordinates.lng,
+          listingLocation.coordinates.lat,
+          listingLocation.coordinates.lng
+        );
+
+        listing.distance = distance;
+        nearbyListings.push({ ...listing, distance });
+      } else {
+        fallbackListings.push(listing);
       }
-    } catch (error) {
-      console.error("Error geocoding city:", error);
     }
   }
 
-  return null;
+  console.log(
+    `Categorization - Area: ${areaListings.length}, Nearby: ${nearbyListings.length}, Fallback: ${fallbackListings.length}`
+  );
+
+  // STRATEGY: Area-first approach
+  let selectedListings = [];
+
+  // 1. PRIORITY: Use area listings if available
+  if (areaListings.length > 0) {
+    console.log(
+      `Found ${areaListings.length} listings in user's area - using area listings only`
+    );
+
+    // Sort area listings by score (highest first)
+    areaListings.sort((a, b) => b.locationScore - a.locationScore);
+    selectedListings = getRandomListings(areaListings, maxResults);
+  } else {
+    console.log(
+      "No listings found in user's area - falling back to nearest listings"
+    );
+
+    // 2. FALLBACK: Use nearest listings sorted by distance
+    if (nearbyListings.length > 0) {
+      // Sort by distance (nearest first)
+      nearbyListings.sort((a, b) => a.distance - b.distance);
+
+      // Take the nearest listings up to maxResults
+      const nearestListings = nearbyListings.slice(0, maxResults * 2); // Get more options for randomization
+      selectedListings = getRandomListings(nearestListings, maxResults);
+
+      console.log(
+        `Using ${
+          selectedListings.length
+        } nearest listings (distances: ${selectedListings
+          .map((l) => l.distance?.toFixed(1) + "km")
+          .join(", ")})`
+      );
+    } else {
+      console.log(
+        "No nearby listings found - using fallback listings without location data"
+      );
+      selectedListings = getRandomListings(fallbackListings, maxResults);
+    }
+  }
+
+  console.log(`Final selection - Total: ${selectedListings.length}`);
+
+  // Light randomization to avoid predictable ordering while maintaining relevance
+  return shuffleArray(selectedListings).slice(0, maxResults);
 }
 
-// Helper function to format listings response
+// Get all approved listings with necessary includes
+async function getAllApprovedListings() {
+  return await prisma.listing.findMany({
+    where: { status: "APPROVED" },
+    include: {
+      category: true,
+      city: true,
+      images: {
+        where: { isPrimary: true },
+        take: 1,
+      },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+function isListingInUserArea(userLocation, listingLocation) {
+  if (!userLocation || !listingLocation) return false;
+
+  // Primary check: Same district
+  if (userLocation.district && listingLocation.district) {
+    if (
+      userLocation.district.toLowerCase() ===
+      listingLocation.district.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+
+  // Secondary check: Same city (if no district match)
+  if (userLocation.city && listingLocation.city) {
+    if (
+      userLocation.city.toLowerCase() === listingLocation.city.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+
+  // Tertiary check: Very close proximity (within 55km in same state)
+  if (
+    userLocation.coordinates &&
+    listingLocation.coordinates &&
+    userLocation.state &&
+    listingLocation.state &&
+    userLocation.state.toLowerCase() === listingLocation.state.toLowerCase()
+  ) {
+    const distance = calculateDistance(
+      userLocation.coordinates.lat,
+      userLocation.coordinates.lng,
+      listingLocation.coordinates.lat,
+      listingLocation.coordinates.lng
+    );
+
+    // Consider within 55km as "same area" if in same state
+    return distance <= 55;
+  }
+
+  return false;
+}
+
+function calculateListingLocationScore(userLocation, listingLocation, listing) {
+  if (!listingLocation) return 0;
+
+  let score = 100; // Base score for being in area
+
+  const bonusWeights = {
+    exactCityMatch: 50,
+    subDistrictMatch: 30,
+    proximityBonus: 20,
+    serviceRadiusBonus: 10,
+  };
+
+  // Bonus for exact city match
+  if (
+    userLocation.city &&
+    listingLocation.city &&
+    userLocation.city.toLowerCase() === listingLocation.city.toLowerCase()
+  ) {
+    score += bonusWeights.exactCityMatch;
+  }
+
+  // Bonus for sub-district match
+  if (
+    userLocation.subDistrict &&
+    listingLocation.subDistrict &&
+    userLocation.subDistrict.toLowerCase() ===
+      listingLocation.subDistrict.toLowerCase()
+  ) {
+    score += bonusWeights.subDistrictMatch;
+  }
+
+  // Proximity bonus within area
+  if (userLocation.coordinates && listingLocation.coordinates) {
+    const distance = calculateDistance(
+      userLocation.coordinates.lat,
+      userLocation.coordinates.lng,
+      listingLocation.coordinates.lat,
+      listingLocation.coordinates.lng
+    );
+
+    listing.distance = distance;
+
+    // Proximity bonus (within area)
+    if (distance <= 5) score += bonusWeights.proximityBonus;
+    else if (distance <= 10) score += bonusWeights.proximityBonus * 0.8;
+    else if (distance <= 20) score += bonusWeights.proximityBonus * 0.6;
+
+    // Service radius bonus
+    if (listing.serviceRadius && distance <= listing.serviceRadius) {
+      score += bonusWeights.serviceRadiusBonus;
+    }
+  }
+
+  return Math.round(score);
+}
+
+// Get comprehensive location data for a listing
+async function getListingLocationData(listing) {
+  try {
+    // Check cache first
+    const cacheKey = `listing_location_${listing.id}`;
+    const cachedLocation = locationCache.get(cacheKey);
+    if (cachedLocation) return cachedLocation;
+
+    let coordinates = null;
+    let locationData = null;
+
+    // Priority 1: Extract from Google Maps URL
+    if (listing.locationUrl) {
+      coordinates = await extractCoordsFromUrl(listing.locationUrl);
+      if (coordinates) {
+        locationData = await getLocationDataFromCoordinates(
+          coordinates.lat,
+          coordinates.lng
+        );
+      }
+    }
+
+    // Priority 2: Geocode from pincode
+    if (!locationData && listing.pincode) {
+      const pincodeLocation = await getEnhancedLocationData(listing.pincode);
+      if (pincodeLocation) {
+        locationData = pincodeLocation;
+      }
+    }
+
+    // Priority 3: Geocode from city name
+    if (!locationData && listing.city) {
+      locationData = await getLocationDataFromCity(listing.city);
+    }
+
+    // Priority 4: Use city relation if available
+    if (!locationData && listing.city && listing.city.name) {
+      locationData = await getLocationDataFromCity(listing.city.name);
+    }
+
+    if (locationData) {
+      // Cache the result
+      locationCache.set(cacheKey, locationData);
+    }
+
+    return locationData;
+  } catch (error) {
+    console.error(
+      `Error getting location data for listing ${listing.id}:`,
+      error.message
+    );
+    return null;
+  }
+}
+
+async function getLocationDataFromCity(cityName) {
+  try {
+    // Check cache first
+    const cacheKey = `city_location_${cityName}`;
+    const cachedLocation = locationCache.get(cacheKey);
+    if (cachedLocation) return cachedLocation;
+
+    // Try Google Geocoding first
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/geocode/json`,
+      {
+        params: {
+          address: `${cityName}, India`,
+          key: process.env.GOOGLE_MAPS_API_KEY,
+        },
+      }
+    );
+
+    if (response.data.status === "OK" && response.data.results?.length > 0) {
+      const result = response.data.results[0];
+
+      const locationData = {
+        coordinates: result.geometry.location,
+        district: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_2"
+        ),
+        subDistrict: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_3"
+        ),
+        city: extractFromAddressComponents(
+          result.address_components,
+          "locality"
+        ),
+        state: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_1"
+        ),
+        formattedAddress: result.formatted_address,
+      };
+
+      // Cache the result
+      locationCache.set(cacheKey, locationData);
+      return locationData;
+    }
+
+    // Fallback to OpenStreetMap
+    const osmResponse = await axios.get(
+      `https://nominatim.openstreetmap.org/search?city=${encodeURIComponent(
+        cityName
+      )}&country=India&format=json&limit=1`,
+      {
+        headers: {
+          "User-Agent": "YourApp/1.0",
+        },
+      }
+    );
+
+    if (osmResponse.data && osmResponse.data.length > 0) {
+      const result = osmResponse.data[0];
+      const locationData = {
+        coordinates: {
+          lat: parseFloat(result.lat),
+          lng: parseFloat(result.lon),
+        },
+        city: result.display_name.split(",")[0].trim(),
+        formattedAddress: result.display_name,
+      };
+
+      // Try to get more detailed info from coordinates
+      const detailedData = await getLocationDataFromCoordinates(
+        locationData.coordinates.lat,
+        locationData.coordinates.lng
+      );
+
+      const finalLocationData = detailedData || locationData;
+      locationCache.set(cacheKey, finalLocationData);
+      return finalLocationData;
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Error geocoding city ${cityName}:`, error.message);
+    return null;
+  }
+}
+
+// Enhanced random selection with Fisher-Yates shuffle
+function getRandomListings(listings, count) {
+  if (listings.length <= count) {
+    return [...listings];
+  }
+
+  const shuffled = [...listings];
+
+  // Fisher-Yates shuffle algorithm
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+
+  return shuffled.slice(0, count);
+}
+
+// Enhanced listing formatter with location score and distance
 function formatListings(listings) {
   return listings.map((listing) => ({
     id: listing.id,
     title: listing.title,
-    category: listing.category.name,
+    category: listing.category?.name || "Uncategorized",
     subcategory: listing.businessCategory || "",
-    location: listing.city,
+    location: listing.city?.name || listing.city || "Unknown",
     date: listing.createdAt.toISOString(),
-    images:
-      listing.images.length +
-      (listing.images.some((img) => img.isPrimary) ? 0 : 1),
-    imageSrc: listing.images[0]?.url || "/api/placeholder/400/300",
+    images: listing.images?.length || 0,
+    imageSrc: listing.images?.[0]?.url || "/api/placeholder/400/300",
     distance: listing.distance
       ? `${listing.distance.toFixed(1)} km`
       : undefined,
+    locationScore: listing.locationScore || 0, // For debugging - can be removed in production
+    slug: listing.slug,
+    price: listing.price,
+    isPromoted: listing.isPromoted || false,
   }));
+}
+
+// Distance calculation using Haversine formula
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371; // Radius of the earth in km
+  const dLat = deg2rad(lat2 - lat1);
+  const dLon = deg2rad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(deg2rad(lat1)) *
+      Math.cos(deg2rad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c; // Distance in km
+}
+
+function deg2rad(deg) {
+  return deg * (Math.PI / 180);
 }
 
 app.post("/listings/:id/promote", authenticateToken, async (req, res) => {
@@ -1352,17 +1703,17 @@ app.get("/home-banner", async (req, res) => {
   }
 });
 
-app.get("/admin-banners", async (req, res) => {
-  try {
-    const banners = await prisma.adminBanner.findMany({
-      where: { active: true },
-      orderBy: { createdAt: "desc" },
-    });
-    res.json(banners);
-  } catch (error) {
-    res.status(500).json({ error: "Failed to fetch banners" });
-  }
-});
+// app.get("/admin-banners", async (req, res) => {
+//   try {
+//     const banners = await prisma.adminBanner.findMany({
+//       where: { active: true },
+//       orderBy: { createdAt: "desc" },
+//     });
+//     res.json(banners);
+//   } catch (error) {
+//     res.status(500).json({ error: "Failed to fetch banners" });
+//   }
+// });
 
 app.get("/pages", async (req, res) => {
   try {
@@ -1392,178 +1743,624 @@ app.get("/pages/:slug", async (req, res) => {
   }
 });
 
-app.get("/banners", async (req, res) => {
+app.get("/middle-banners", async (req, res) => {
   try {
-    const currentDate = new Date();
-    const userPincode = req.query.pincode?.toString();
+    const userPincode = req.query.location?.toString();
+    const maxResults = parseInt(req.query.limit) || 10;
 
-    // Base query
-    const banners = await prisma.listing.findMany({
-      where: {
-        status: "APPROVED",
-        isBannerEnabled: true,
-        OR: [
-          {
-            promotions: {
-              some: {
-                isActive: true,
-                OR: [{ endDate: null }, { endDate: { gte: currentDate } }],
-              },
-            },
-          },
-          { subscription: { promotionDays: { gt: 0 }, isActive: true } },
-        ],
-      },
-      include: {
-        category: true,
-        city: true,
-        images: { where: { isBanner: true }, take: 1 },
-        promotions: {
-          where: {
-            isActive: true,
-            OR: [{ endDate: null }, { endDate: { gte: currentDate } }],
-          },
-          orderBy: { startDate: "desc" },
-          take: 1,
-        },
-        subscription: true,
-      },
-      orderBy: { createdAt: "desc" },
-    });
-
-    // If no pincode, return all banners
-    if (!userPincode) {
-      return res.json(formatBanners(banners.slice(0, 10)));
-    }
-
-    // Get coordinates from geocoding service
-    const userCoords = await getCoordinatesFromPincode(userPincode);
-
-    // Filter banners based on location
-    const filteredBanners = await Promise.all(
-      banners.map(async (listing) => {
-        // Always include listings without service radius
-        if (
-          listing.serviceRadius === null ||
-          listing.serviceRadius === undefined
-        ) {
-          return listing;
-        }
-
-        // Exclude listings that require location if we don't have user coordinates
-        if (!userCoords) {
-          return null;
-        }
-
-        // Skip listings without locationUrl if they have service radius
-        if (!listing.locationUrl) {
-          return null;
-        }
-
-        try {
-          const listingCoords = await extractCoordsFromUrl(listing.locationUrl);
-          if (!listingCoords) return null;
-
-          const distance = calculateDistance(
-            userCoords.lat,
-            userCoords.lng,
-            listingCoords.lat,
-            listingCoords.lng
-          );
-
-          console.log(`Distance for listing ${listing.id}:`, distance, "km");
-          console.log(
-            `Service radius for listing ${listing.id}:`,
-            listing.serviceRadius,
-            "km"
-          );
-
-          // Convert both to meters for comparison
-          const distanceInMeters = distance * 1000;
-          const radiusInMeters = listing.serviceRadius * 1000;
-
-          // Only include if distance is within service radius
-          if (distanceInMeters <= radiusInMeters) {
-            console.log(`Including listing ${listing.id} - within radius`);
-            return listing;
-          } else {
-            console.log(`Excluding listing ${listing.id} - outside radius`);
-            return null;
-          }
-        } catch (error) {
-          console.error(
-            `Error processing listing ${listing.id}:`,
-            error.message
-          );
-          return null;
-        }
-      })
+    const banners = await getFilteredMiddleBanners(userPincode, maxResults);
+    console.log(
+      `Returning ${banners.length} banners for pincode: ${userPincode || "all"}`
     );
-
-    // Filter out null values and get the first 10
-    const validBanners = filteredBanners.filter(Boolean).slice(0, 10);
-
-    console.log("Final banners count:", validBanners.length);
-    res.json(formatBanners(validBanners));
+    res.json(formatMiddleBanners(banners));
   } catch (error) {
     console.error("Error fetching banners:", error);
     res.status(500).json({ error: "Failed to fetch banners" });
   }
 });
 
-async function resolveShortUrl(url) {
+app.get("/bottom-banners", async (req, res) => {
   try {
-    const response = await axios.head(url, {
-      maxRedirects: 5,
-      validateStatus: null,
-    });
-    return response.request.res.responseUrl || url;
+    const userPincode = req.query.location?.toString();
+    const maxResults = parseInt(req.query.limit) || 10;
+
+    const banners = await getFilteredBottomBanners(userPincode, maxResults);
+    console.log(
+      `Returning ${banners.length} banners for pincode: ${userPincode || "all"}`
+    );
+    res.json(formatBottomBanners(banners));
   } catch (error) {
-    console.error(`Error resolving short URL ${url}:`, error.message);
-    return url; // Return original if resolution fails
+    console.error("Error fetching banners:", error);
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+app.get("/hero-banners", async (req, res) => {
+  try {
+    const userPincode = req.query.location?.toString();
+    const maxResults = parseInt(req.query.limit) || 10;
+
+    const banners = await getFilteredHeroBanners(userPincode, maxResults);
+    console.log(
+      `Returning ${banners.length} banners for pincode: ${userPincode || "all"}`
+    );
+    res.json(formatHeroBanners(banners));
+  } catch (error) {
+    console.error("Error fetching banners:", error);
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+app.get("/category-banners", async (req, res) => {
+  try {
+    const userPincode = req.query.location?.toString();
+    const categoryName = req.query.category?.toString();
+    const maxResults = parseInt(req.query.limit) || 10;
+
+    const banners = await getFilteredCategoryBanners(
+      categoryName,
+      userPincode,
+      maxResults
+    );
+    console.log(
+      `Returning ${banners.length} banners for pincode: ${userPincode || "all"}`
+    );
+    res.json(formatCategoryBanners(banners));
+  } catch (error) {
+    console.error("Error fetching banners:", error);
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+async function getFilteredBanners(userPincode, maxResults = 10) {
+  const allBanners = await getAllEligibleBanners();
+
+  // If no pincode provided, return all banners randomly
+  if (!userPincode) {
+    console.log(
+      "No pincode provided - returning random banners from all available"
+    );
+    return shuffleArray(allBanners).slice(0, maxResults);
+  }
+
+  // Get enhanced user location data
+  const userLocation = await getEnhancedLocationData(userPincode);
+
+  if (!userLocation) {
+    console.log(
+      `Could not determine location for pincode: ${userPincode} - returning all banners`
+    );
+    return shuffleArray(allBanners).slice(0, maxResults);
+  }
+
+  console.log(`User location data for ${userPincode}:`, {
+    district: userLocation.district,
+    city: userLocation.city,
+    state: userLocation.state,
+    coordinates: userLocation.coordinates,
+  });
+
+  // Categorize banners by location relevance
+  const areaBanners = []; // Same district/area
+  const nearbyBanners = []; // Within 55km in same state
+  const fallbackBanners = []; // No location data or no location restrictions
+
+  for (const banner of allBanners) {
+    const bannerLocation = await getBannerLocationData(banner);
+
+    // If banner has no location data, check if it has any location restrictions
+    if (!bannerLocation) {
+      // Only include banners without ANY location restrictions in fallback
+      if (!banner.locationUrl && !banner.pincode && !banner.city) {
+        fallbackBanners.push({ ...banner, locationScore: 50 }); // Medium priority for global banners
+        console.log(
+          `Global banner ${banner.id} added to fallback (no location restrictions)`
+        );
+      } else {
+        console.log(
+          `Banner ${banner.id} skipped (has location fields but couldn't resolve location)`
+        );
+      }
+      continue;
+    }
+
+    // Check if banner is in the same area (district match)
+    const isInSameArea = isBannerInUserArea(userLocation, bannerLocation);
+
+    if (isInSameArea) {
+      // Calculate score for sorting within area
+      const score = calculateBannerLocationScore(
+        userLocation,
+        bannerLocation,
+        banner
+      );
+      areaBanners.push({ ...banner, locationScore: score });
+      console.log(
+        `✓ Area banner ${banner.id}: ${
+          bannerLocation?.district || "No district"
+        } (Score: ${score})`
+      );
+    } else {
+      // Check if banner is within 55km radius and in same state
+      if (
+        userLocation.coordinates &&
+        bannerLocation.coordinates &&
+        userLocation.state &&
+        bannerLocation.state &&
+        userLocation.state.toLowerCase() === bannerLocation.state.toLowerCase()
+      ) {
+        const distance = calculateDistance(
+          userLocation.coordinates.lat,
+          userLocation.coordinates.lng,
+          bannerLocation.coordinates.lat,
+          bannerLocation.coordinates.lng
+        );
+
+        // Check 55km radius within same state
+        if (distance <= 55) {
+          banner.distance = distance;
+          nearbyBanners.push({ ...banner, distance });
+          console.log(
+            `→ Nearby banner ${banner.id}: ${distance.toFixed(
+              1
+            )}km away (same state)`
+          );
+        } else {
+          console.log(
+            `Banner ${
+              banner.id
+            } excluded - outside 55km radius (${distance.toFixed(1)}km > 55km)`
+          );
+        }
+      } else {
+        // No coordinates available or different state, add to fallback if no location restrictions
+        if (!banner.locationUrl && !banner.pincode && !banner.city) {
+          fallbackBanners.push({ ...banner, locationScore: 25 });
+        } else {
+          console.log(
+            `Banner ${banner.id} excluded - different state or no coordinates`
+          );
+        }
+      }
+    }
+  }
+
+  console.log(
+    `Banner categorization - Area: ${areaBanners.length}, Nearby: ${nearbyBanners.length}, Fallback: ${fallbackBanners.length}`
+  );
+
+  // STRATEGY: Area-first approach
+  let selectedBanners = [];
+
+  // 1. PRIORITY: Use area banners if available
+  if (areaBanners.length > 0) {
+    console.log(
+      `Found ${areaBanners.length} banners in user's area - using area banners only`
+    );
+
+    // Sort area banners by score (highest first)
+    areaBanners.sort((a, b) => b.locationScore - a.locationScore);
+    selectedBanners = areaBanners.slice(0, maxResults);
+  } else {
+    console.log(
+      "No banners found in user's area - falling back to nearest banners within 55km"
+    );
+
+    // 2. FALLBACK: Use nearest banners within 55km sorted by distance
+    if (nearbyBanners.length > 0) {
+      // Sort by distance (nearest first)
+      nearbyBanners.sort((a, b) => a.distance - b.distance);
+      selectedBanners = nearbyBanners.slice(0, maxResults);
+
+      console.log(
+        `Using ${
+          selectedBanners.length
+        } nearest banners within 55km (distances: ${selectedBanners
+          .map((b) => b.distance?.toFixed(1) + "km")
+          .join(", ")})`
+      );
+    } else {
+      // 3. LAST RESORT: Use fallback banners (global banners with no location restrictions)
+      console.log(
+        "No nearby banners found within 55km - using global banners without location restrictions"
+      );
+      selectedBanners = fallbackBanners.slice(0, maxResults);
+    }
+  }
+
+  console.log(`Final banner selection - Total: ${selectedBanners.length}`);
+
+  // Light shuffle to avoid predictable ordering while maintaining relevance
+  return shuffleArray(selectedBanners).slice(0, maxResults);
+}
+
+// Check if banner is in user's area (same district or administrative boundary)
+function isBannerInUserArea(userLocation, bannerLocation) {
+  if (!userLocation || !bannerLocation) return false;
+
+  // Primary check: Same district
+  if (userLocation.district && bannerLocation.district) {
+    if (
+      userLocation.district.toLowerCase() ===
+      bannerLocation.district.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+
+  // Secondary check: Same city (if no district match)
+  if (userLocation.city && bannerLocation.city) {
+    if (userLocation.city.toLowerCase() === bannerLocation.city.toLowerCase()) {
+      return true;
+    }
+  }
+
+  // Tertiary check: Very close proximity (within 15km in same state)
+  if (
+    userLocation.coordinates &&
+    bannerLocation.coordinates &&
+    userLocation.state &&
+    bannerLocation.state &&
+    userLocation.state.toLowerCase() === bannerLocation.state.toLowerCase()
+  ) {
+    const distance = calculateDistance(
+      userLocation.coordinates.lat,
+      userLocation.coordinates.lng,
+      bannerLocation.coordinates.lat,
+      bannerLocation.coordinates.lng
+    );
+
+    // Consider within 55km as "same area" if in same state
+    return distance <= 55;
+  }
+
+  return false;
+}
+
+async function getAllEligibleBanners() {
+  const currentDate = new Date();
+
+  return await prisma.listing.findMany({
+    where: {
+      status: "APPROVED",
+      isBannerEnabled: true,
+      OR: [
+        {
+          promotions: {
+            some: {
+              isActive: true,
+              OR: [{ endDate: null }, { endDate: { gte: currentDate } }],
+            },
+          },
+        },
+        { subscription: { promotionDays: { gt: 0 }, isActive: true } },
+      ],
+    },
+    include: {
+      category: true,
+      city: true,
+      images: { where: { isBanner: true }, take: 1 },
+      promotions: {
+        where: {
+          isActive: true,
+          OR: [{ endDate: null }, { endDate: { gte: currentDate } }],
+        },
+        orderBy: { startDate: "desc" },
+        take: 1,
+      },
+      subscription: true,
+    },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+// async function getAllEligibleBanners() {
+
+// }
+
+function calculateBannerLocationScore(userLocation, bannerLocation, banner) {
+  if (!bannerLocation) return 0;
+
+  let score = 100; // Base score for being in area
+
+  const bonusWeights = {
+    exactCityMatch: 50,
+    subDistrictMatch: 30,
+    proximityBonus: 20,
+  };
+
+  // Bonus for exact city match
+  if (
+    userLocation.city &&
+    bannerLocation.city &&
+    userLocation.city.toLowerCase() === bannerLocation.city.toLowerCase()
+  ) {
+    score += bonusWeights.exactCityMatch;
+    console.log(`✓ City match for banner ${banner.id}: ${bannerLocation.city}`);
+  }
+
+  // Bonus for sub-district match
+  if (
+    userLocation.subDistrict &&
+    bannerLocation.subDistrict &&
+    userLocation.subDistrict.toLowerCase() ===
+      bannerLocation.subDistrict.toLowerCase()
+  ) {
+    score += bonusWeights.subDistrictMatch;
+    console.log(
+      `✓ Sub-district match for banner ${banner.id}: ${bannerLocation.subDistrict}`
+    );
+  }
+
+  // Proximity bonus within area
+  if (userLocation.coordinates && bannerLocation.coordinates) {
+    const distance = calculateDistance(
+      userLocation.coordinates.lat,
+      userLocation.coordinates.lng,
+      bannerLocation.coordinates.lat,
+      bannerLocation.coordinates.lng
+    );
+
+    banner.distance = distance;
+    console.log(`Distance for banner ${banner.id}: ${distance.toFixed(2)}km`);
+
+    // Proximity bonus (within area)
+    if (distance <= 5) score += bonusWeights.proximityBonus;
+    else if (distance <= 10) score += bonusWeights.proximityBonus * 0.8;
+    else if (distance <= 20) score += bonusWeights.proximityBonus * 0.6;
+  }
+
+  return Math.round(score);
+}
+
+async function getBannerLocationData(banner) {
+  try {
+    // Check cache first
+    const cacheKey = `banner_location_${banner.id}`;
+    const cachedLocation = locationCache.get(cacheKey);
+    if (cachedLocation) return cachedLocation;
+
+    let coordinates = null;
+    let locationData = null;
+
+    // Priority 1: Extract from Google Maps URL (locationUrl)
+    if (banner.locationUrl) {
+      coordinates = await extractCoordsFromUrl(banner.locationUrl);
+      if (coordinates) {
+        locationData = await getLocationDataFromCoordinates(
+          coordinates.lat,
+          coordinates.lng
+        );
+        console.log(
+          `✓ Got location data from locationUrl for banner ${banner.id}`
+        );
+      }
+    }
+
+    // Priority 2: Geocode from pincode
+    if (!locationData && banner.pincode) {
+      const pincodeLocation = await getEnhancedLocationData(banner.pincode);
+      if (pincodeLocation) {
+        locationData = pincodeLocation;
+        console.log(
+          `✓ Got location data from pincode ${banner.pincode} for banner ${banner.id}`
+        );
+      }
+    }
+
+    // Priority 3: Geocode from city name
+    if (!locationData && banner.city) {
+      locationData = await getLocationDataFromCity(banner.city);
+      if (locationData) {
+        console.log(`✓ Got location data from city for banner ${banner.id}`);
+      }
+    }
+
+    // Priority 4: Use city relation if available
+    if (!locationData && banner.city && banner.city.name) {
+      locationData = await getLocationDataFromCity(banner.city.name);
+      if (locationData) {
+        console.log(
+          `✓ Got location data from city relation for banner ${banner.id}`
+        );
+      }
+    }
+
+    if (locationData) {
+      // Cache the result
+      locationCache.set(cacheKey, locationData);
+      console.log(`Cached location data for banner ${banner.id}:`, {
+        district: locationData.district,
+        city: locationData.city,
+        coordinates: locationData.coordinates,
+      });
+    } else {
+      console.log(`⚠️ Could not determine location for banner ${banner.id}`);
+    }
+
+    return locationData;
+  } catch (error) {
+    console.error(
+      `Error getting location data for banner ${banner.id}:`,
+      error.message
+    );
+    return null;
   }
 }
 
-// Helper function to extract coordinates from URL
+// Get detailed location data from coordinates
+async function getLocationDataFromCoordinates(lat, lng) {
+  try {
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/geocode/json`,
+      {
+        params: {
+          latlng: `${lat},${lng}`,
+          key: process.env.GOOGLE_MAPS_API_KEY,
+        },
+      }
+    );
+
+    if (response.data.status === "OK" && response.data.results?.length > 0) {
+      const result = response.data.results[0];
+
+      return {
+        coordinates: { lat, lng },
+        district: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_2"
+        ),
+        subDistrict: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_3"
+        ),
+        city: extractFromAddressComponents(
+          result.address_components,
+          "locality"
+        ),
+        state: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_1"
+        ),
+        pincode: extractFromAddressComponents(
+          result.address_components,
+          "postal_code"
+        ),
+        formattedAddress: result.formatted_address,
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error(
+      `Failed to get location data for coordinates ${lat}, ${lng}:`,
+      error.message
+    );
+    return null;
+  }
+}
+
+// Enhanced location data extraction for user pincode
+async function getEnhancedLocationData(pincode) {
+  try {
+    // Check cache first
+    const cacheKey = `enhanced_location_${pincode}`;
+    const cachedLocation = locationCache.get(cacheKey);
+    if (cachedLocation) return cachedLocation;
+
+    const response = await axios.get(
+      `https://maps.googleapis.com/maps/api/geocode/json`,
+      {
+        params: {
+          address: pincode,
+          components: "country:IN",
+          key: process.env.GOOGLE_MAPS_API_KEY,
+        },
+      }
+    );
+
+    if (response.data.status === "OK" && response.data.results?.length > 0) {
+      const result = response.data.results[0];
+
+      const locationData = {
+        coordinates: result.geometry.location,
+        district: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_2"
+        ),
+        subDistrict: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_3"
+        ),
+        city: extractFromAddressComponents(
+          result.address_components,
+          "locality"
+        ),
+        state: extractFromAddressComponents(
+          result.address_components,
+          "administrative_area_level_1"
+        ),
+        pincode: extractFromAddressComponents(
+          result.address_components,
+          "postal_code"
+        ),
+        formattedAddress: result.formatted_address,
+      };
+
+      // Cache the result
+      locationCache.set(cacheKey, locationData);
+
+      return locationData;
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Enhanced location lookup failed for ${pincode}:`, error);
+    return null;
+  }
+}
+
+// Extract specific component from Google's address components
+function extractFromAddressComponents(addressComponents, targetType) {
+  const component = addressComponents.find((comp) =>
+    comp.types.includes(targetType)
+  );
+  return component?.long_name || null;
+}
+
+function shuffleArray(array) {
+  const shuffled = [...array];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
 async function extractCoordsFromUrl(url) {
   try {
+    // Handle shortened URLs
     if (url.includes("goo.gl") || url.includes("maps.app.goo.gl")) {
       url = await resolveShortUrl(url);
     }
 
-    // Rest of your existing code remains the same...
+    // Method 1: Extract from @ parameter
     if (url.includes("@")) {
       const parts = url.split("@")[1].split(",");
       if (parts.length >= 2) {
-        return {
-          lat: parseFloat(parts[0]),
-          lng: parseFloat(parts[1]),
-        };
+        const lat = parseFloat(parts[0]);
+        const lng = parseFloat(parts[1]);
+        if (!isNaN(lat) && !isNaN(lng)) {
+          return { lat, lng };
+        }
       }
     }
 
-    // Handle URL with query parameters
+    // Method 2: Extract from query parameters
     const urlObj = new URL(url);
     const qParam = urlObj.searchParams.get("q");
     if (qParam) {
       const coords = qParam.split(",");
       if (coords.length === 2) {
-        return {
-          lat: parseFloat(coords[0]),
-          lng: parseFloat(coords[1]),
-        };
+        const lat = parseFloat(coords[0]);
+        const lng = parseFloat(coords[1]);
+        if (!isNaN(lat) && !isNaN(lng)) {
+          return { lat, lng };
+        }
       }
     }
 
-    // Handle URL with /place/ format
+    // Method 3: Extract from place format (!3d and !4d)
     const placeMatch = url.match(/!3d([\d.-]+)!4d([\d.-]+)/);
     if (placeMatch) {
-      return {
-        lat: parseFloat(placeMatch[1]),
-        lng: parseFloat(placeMatch[2]),
-      };
+      const lat = parseFloat(placeMatch[1]);
+      const lng = parseFloat(placeMatch[2]);
+      if (!isNaN(lat) && !isNaN(lng)) {
+        return { lat, lng };
+      }
     }
 
+    console.log(`Could not extract coordinates from URL: ${url}`);
     return null;
   } catch (error) {
     console.error(`Error extracting coords from URL ${url}:`, error.message);
@@ -1571,26 +2368,27 @@ async function extractCoordsFromUrl(url) {
   }
 }
 
-// Distance calculation helper
-function calculateDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371; // Radius of the earth in km
-  const dLat = deg2rad(lat2 - lat1);
-  const dLon = deg2rad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(deg2rad(lat1)) *
-      Math.cos(deg2rad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c; // Distance in km
+// Enhanced URL resolution with better error handling
+async function resolveShortUrl(url) {
+  try {
+    const response = await axios.head(url, {
+      maxRedirects: 10,
+      timeout: 5000,
+      validateStatus: null,
+    });
+
+    const resolvedUrl =
+      response.request?.res?.responseUrl || response.headers?.location || url;
+
+    console.log(`Resolved ${url} -> ${resolvedUrl}`);
+    return resolvedUrl;
+  } catch (error) {
+    console.error(`Error resolving short URL ${url}:`, error.message);
+    return url;
+  }
 }
 
-function deg2rad(deg) {
-  return deg * (Math.PI / 180);
-}
-
-// Format banners for response
+// Enhanced banner formatting with location score
 function formatBanners(banners) {
   return banners.map((listing) => {
     const promotion =
@@ -1619,42 +2417,123 @@ function formatBanners(banners) {
       promotionEndDate: promotion?.endDate,
       isSubscriptionPromotion:
         !listing.promotions.length && !!listing.subscription,
+      locationScore: listing.locationScore || 0,
     };
   });
 }
 
-async function getCoordinatesFromPincode(pincode) {
+async function getDistrictFromPincode(pincode) {
+  try {
+    // Google Geocoding attempt
+    const res = await axios.get(
+      `https://maps.googleapis.com/maps/api/geocode/json`,
+      {
+        params: {
+          address: pincode,
+          region: "in",
+          key: process.env.GOOGLE_MAPS_API_KEY,
+        },
+      }
+    );
+
+    const components = res.data?.results?.[0]?.address_components;
+    if (components) {
+      const district = extractDistrictFromAddressComponents(components);
+      if (district) return district;
+    }
+
+    // 🔁 Fallback: India Post API
+    const indiaPostRes = await axios.get(
+      `https://api.postalpincode.in/pincode/${pincode}`
+    );
+    const districtFallback =
+      indiaPostRes.data?.[0]?.PostOffice?.[0]?.District || null;
+    console.log(indiaPostRes.data?.[0]?.PostOffice);
+    if (districtFallback) {
+      console.log(
+        `[Fallback] Got district from India Post API: ${districtFallback}`
+      );
+      return districtFallback;
+    }
+
+    console.warn(`District could not be resolved for pincode ${pincode}`);
+    return null;
+  } catch (error) {
+    console.error("Error in getDistrictFromPincode:", error.message);
+    return null;
+  }
+}
+
+function extractDistrictFromAddressComponents(addressComponents) {
+  // Look for district in address components
+  // Google Maps API uses different types for administrative areas
+  const districtTypes = [
+    "administrative_area_level_2", // District level in India
+    "administrative_area_level_3", // Sub-district level
+    "locality", // City/town level
+  ];
+
+  for (const component of addressComponents) {
+    for (const type of districtTypes) {
+      if (component.types.includes(type)) {
+        return component.long_name;
+      }
+    }
+  }
+
+  return null;
+}
+
+async function getDistrictFromCoordinates(lat, lng) {
   try {
     // Check cache first
-    const cachedCoords = pincodeCache.get(pincode);
-    if (cachedCoords) return cachedCoords;
+    const cacheKey = `district_${lat}_${lng}`;
+    const cachedDistrict = pincodeCache.get(cacheKey);
+    if (cachedDistrict) return cachedDistrict;
 
     const response = await axios.get(
       `https://maps.googleapis.com/maps/api/geocode/json`,
       {
         params: {
-          address: pincode,
-          components: "country:IN",
+          latlng: `${lat},${lng}`,
           key: process.env.GOOGLE_MAPS_API_KEY,
         },
       }
     );
 
     if (response.data.status === "OK" && response.data.results?.length > 0) {
-      const location = response.data.results[0].geometry.location;
-      const coords = { lat: location.lat, lng: location.lng };
+      const result = response.data.results[0];
 
-      // Cache the result
-      pincodeCache.set(pincode, coords);
-      return coords;
+      // Extract district from address components
+      const district = extractDistrictFromAddressComponents(
+        result.address_components
+      );
+
+      console.log(district, "listing");
+
+      if (district) {
+        // Cache the result
+        pincodeCache.set(cacheKey, district);
+        return district;
+      }
     }
 
     return null;
   } catch (error) {
-    console.error(`Geocoding failed for pincode ${pincode}:`, error.message);
+    console.error(
+      `Failed to get district for coordinates ${lat}, ${lng}:`,
+      error.message
+    );
     return null;
   }
 }
+
+export const locationCache = new Map();
+
+setInterval(() => {
+  locationCache.clear();
+  console.log("Location cache cleared");
+}, 6 * 60 * 60 * 1000);
 
 app.get("/subscription-plans", async (req, res) => {
   try {

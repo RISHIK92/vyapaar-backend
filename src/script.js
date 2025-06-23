@@ -10,6 +10,7 @@ import { uploadFileToS3, deleteFileFromS3 } from "./utils/upload.js";
 import multer from "multer";
 import homeRouter from "./routes/homeCategories.js";
 import authenticateToken from "./middleware/auth.js";
+import fs from "fs";
 
 dotenv.config();
 
@@ -28,14 +29,10 @@ app.use(
 );
 app.use("/home-categories", homeRouter);
 
-// Helper Functions
-const generateSlug = () => {
-  return title
-    .toLowerCase()
-    .replace(/[^\w\s]/gi, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .substring(0, 60);
+const calculateExpirationDate = (durationDays) => {
+  const date = new Date();
+  date.setDate(date.getDate() + durationDays);
+  return date;
 };
 
 const cleanupRejectedListings = async () => {
@@ -625,6 +622,7 @@ app.get("/listing/:slug", async (req, res) => {
       isBannerEnabled: listing.isBannerEnabled,
       youtubeVideo: listing.youtubeVideo,
       locationUrl: listing.locationUrl,
+      pincode: listing.pincode,
       serviceRadius: listing.serviceRadius,
       AdminApproval: listing.AdminApproval,
       images: listing.images,
@@ -641,170 +639,411 @@ app.get("/listing/:slug", async (req, res) => {
   }
 });
 
-app.post("/listings", authenticateToken, async (req, res) => {
+app.post(
+  "/admin/upload",
+  authenticateToken,
+  upload.array("images", 10),
+  async (req, res) => {
+    try {
+      if (!req.files || req.files.length === 0) {
+        return res.status(400).json({ error: "No files uploaded" });
+      }
+
+      const imageTypes = [];
+      for (let i = 0; i < req.files.length; i++) {
+        const typeKey = `imageTypes[${i}]`;
+        imageTypes.push(req.body[typeKey] || "gallery");
+      }
+
+      const uploadPromises = req.files.map((file) => uploadFileToS3(file));
+      const uploadedFiles = await Promise.all(uploadPromises);
+
+      const urls = uploadedFiles.map((file, index) => ({
+        url: file.url,
+        type: imageTypes[index],
+        isPrimary: imageTypes[index] === "featured",
+        isGallery: imageTypes[index] === "gallery",
+        order: index,
+      }));
+
+      const primaryImage =
+        urls.find((img) => img.isPrimary)?.url || urls[0]?.url;
+
+      res.status(200).json({
+        success: true,
+        images: urls,
+        primaryImage,
+        galleryImages: urls
+          .filter((img) => img.isGallery)
+          .map((img) => img.url),
+      });
+    } catch (error) {
+      console.error("Admin upload error:", error);
+      res.status(500).json({ error: "Failed to upload files" });
+    }
+  }
+);
+
+app.post("/admin/listings", authenticateToken, async (req, res) => {
   try {
     const {
+      categoryId,
+      type,
       title,
       description,
-      type,
       price,
       negotiable,
-      city,
+      cityId,
       tags,
       highlights,
-      businessHours,
       phone,
       website,
-      categoryId,
-      listingType,
+      businessHours,
       businessCategory,
       establishedYear,
       serviceArea,
       teamSize,
-      images,
+      rating,
+      reviewCount,
+      listingTier = "FREE",
+      photos, // This should be an array of { url, isBanner }
+      youtubeVideo,
+      locationUrl,
+      serviceRadius,
     } = req.body;
 
-    if (!title || !description || !type || !price || !city || !categoryId) {
-      return res.status(400).json({ message: "Required fields are missing" });
+    if (!categoryId || !title || !description || !cityId) {
+      return res.status(400).json({
+        error: "Category, title, description, and city are required",
+      });
     }
 
-    const slug = generateSlug(title);
-    const existingSlug = await prisma.listing.findUnique({ where: { slug } });
-
-    if (existingSlug) {
-      return res.status(400).json({ message: "Title already exists" });
+    let processedHours = {};
+    if (businessHours) {
+      if (typeof businessHours === "string") {
+        try {
+          processedHours = JSON.parse(businessHours);
+        } catch (e) {
+          console.error("Error parsing business hours", e);
+        }
+      } else {
+        processedHours = businessHours;
+      }
     }
 
-    const listing = await prisma.listing.create({
+    const baseSlug = title
+      .toLowerCase()
+      .replace(/\s+/g, "-")
+      .replace(/[^\w-]+/g, "");
+    let slug = baseSlug;
+    let counter = 1;
+
+    while (await prisma.listing.findFirst({ where: { slug } })) {
+      slug = `${baseSlug}-${counter}`;
+      counter++;
+    }
+
+    // Direct approval for admin-created listings
+    const initialStatus = "APPROVED";
+    const isBannerEnabled = listingTier !== "FREE";
+
+    // Set expiration based on tier (longer durations for admin-created listings)
+    let expiresAt;
+    if (listingTier === "FREE") {
+      expiresAt = calculateExpirationDate(90); // 90 days for FREE
+    } else if (listingTier === "PREMIUM") {
+      expiresAt = calculateExpirationDate(180); // 180 days for PREMIUM
+    } else if (listingTier === "PREMIUM_PLUS") {
+      expiresAt = calculateExpirationDate(365); // 1 year for PREMIUM_PLUS
+    }
+
+    const newListing = await prisma.listing.create({
       data: {
         title,
         description,
+        type: type === "Professional" ? "PROFESSIONAL" : "PRIVATE_INDIVIDUAL",
+        price: parseFloat(price) || 0,
+        negotiable: negotiable === "true" || negotiable === true,
+        category: { connect: { id: categoryId } },
+        user: { connect: { id: req.user.userId } },
+        city: { connect: { id: cityId } },
+        tags: Array.isArray(tags) ? tags : tags?.split(",") || [],
+        highlights: Array.isArray(highlights)
+          ? highlights
+          : highlights?.split(",") || [],
+        phone: phone || null,
+        website: website || null,
+        businessHours: processedHours,
+        businessCategory: businessCategory || null,
+        establishedYear: establishedYear ? parseInt(establishedYear) : null,
+        serviceArea: serviceArea || null,
+        teamSize: teamSize || null,
+        rating: rating ? parseFloat(rating) : null,
+        reviewCount: reviewCount ? parseInt(reviewCount) : null,
+        listingTier: listingTier,
+        status: initialStatus,
         slug,
-        type,
-        price,
-        negotiable,
-        city,
-        tags,
-        highlights,
-        businessHours,
-        phone,
-        website,
-        categoryId,
-        listingType,
-        userId: req.user.userId,
-        businessCategory,
-        establishedYear,
-        serviceArea,
-        teamSize,
+        expiresAt: expiresAt,
+        isBannerEnabled,
+        youtubeVideo: youtubeVideo || null,
+        locationUrl: locationUrl || null,
+        serviceRadius: serviceRadius ? parseInt(serviceRadius) : null,
+      },
+      include: {
+        category: true,
+        user: true,
+        city: true,
       },
     });
 
-    // Add images
-    if (images && images.length > 0) {
+    if (photos && photos.length > 0) {
+      const bannerIndex = photos.findIndex((photo) => photo.isBanner);
+
       await prisma.image.createMany({
-        data: images.map((img, index) => ({
-          url: img,
-          listingId: listing.id,
+        data: photos.map((photo, index) => ({
+          url: photo.url,
           isPrimary: index === 0,
+          isBanner: index === bannerIndex,
+          listingId: newListing.id,
         })),
       });
     }
 
-    res.status(201).json(listing);
+    // Create promotion if tier is not FREE
+    if (listingTier !== "FREE") {
+      const promotionDays = listingTier === "PREMIUM" ? 30 : 60; // 30 days for PREMIUM, 60 for PREMIUM_PLUS
+      await prisma.promotion.create({
+        data: {
+          listingId: newListing.id,
+          price: 0, // Admin-created promotions are free
+          startDate: new Date(),
+          endDate: calculateExpirationDate(promotionDays),
+          durationDays: promotionDays,
+          isActive: true,
+        },
+      });
+    }
+
+    res.status(201).json({
+      message: "Admin listing created and approved successfully",
+      listing: newListing,
+    });
   } catch (error) {
-    console.error("Create listing error:", error);
-    res.status(500).json({ message: "Error creating listing" });
+    console.error("Error creating admin listing:", error);
+    res.status(500).json({ error: "Failed to create admin listing" });
   }
 });
 
-app.put("/listings/:id", authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const {
-      title,
-      description,
-      type,
-      price,
-      negotiable,
-      city,
-      tags,
-      highlights,
-      businessHours,
-      phone,
-      website,
-      categoryId,
-      listingType,
-      businessCategory,
-      establishedYear,
-      serviceArea,
-      teamSize,
-      images,
-    } = req.body;
+app.put(
+  "/admin/listing/:id",
+  authenticateToken,
+  upload.array("images"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const userId = req.user.userId;
 
-    const listing = await prisma.listing.findUnique({
-      where: { id: parseInt(id) },
-    });
-
-    if (!listing) {
-      return res.status(404).json({ message: "Listing not found" });
-    }
-
-    if (listing.userId !== req.user.userId) {
-      return res
-        .status(403)
-        .json({ message: "Not authorized to edit this listing" });
-    }
-
-    if (listing.status !== "PENDING_APPROVAL") {
-      return res
-        .status(400)
-        .json({ message: "Only pending listings can be edited" });
-    }
-
-    const updatedListing = await prisma.listing.update({
-      where: { id: parseInt(id) },
-      data: {
+      const {
         title,
         description,
-        type,
         price,
         negotiable,
-        city,
-        tags,
-        highlights,
+        categoryId,
+        cityId,
+        listingTier,
+        type,
+        tags = [],
+        highlights = [],
         businessHours,
         phone,
         website,
-        categoryId,
-        listingType,
         businessCategory,
         establishedYear,
         serviceArea,
         teamSize,
-      },
-    });
+        youtubeVideo,
+        locationUrl,
+        pincode,
+        serviceRadius,
+        imagesToDelete = [],
+      } = req.body;
 
-    // Update images
-    if (images && images.length > 0) {
-      // Delete existing images
-      await prisma.image.deleteMany({ where: { listingId: id } });
+      // Find the listing
+      const listing = await prisma.listing.findUnique({
+        where: { id: parseInt(id) },
+        include: {
+          images: true,
+          user: true,
+          AdminApproval: true,
+        },
+      });
 
-      // Add new images
-      await prisma.image.createMany({
-        data: images.map((img, index) => ({
-          url: img,
-          listingId: id,
-          isPrimary: index === 0,
-        })),
+      if (!listing) {
+        return res.status(404).json({
+          success: false,
+          message: "Listing not found",
+        });
+      }
+
+      // Authorization check - only owner or admin can edit
+      if (listing.userId !== userId) {
+        return res.status(403).json({
+          success: false,
+          message: "Not authorized to edit this listing",
+        });
+      }
+
+      // Process image deletions first
+      if (imagesToDelete.length > 0) {
+        // Get the image records to be deleted
+        const imagesToRemove = await prisma.image.findMany({
+          where: {
+            id: { in: imagesToDelete.map((id) => parseInt(id)) },
+            listingId: listing.id,
+          },
+        });
+
+        // Delete from S3 first
+        await Promise.all(
+          imagesToRemove.map(async (image) => {
+            try {
+              const fileKey = image.url.split("/").pop();
+              await deleteFileFromS3(fileKey);
+            } catch (error) {
+              console.error(`Error deleting file from S3: ${image.url}`, error);
+            }
+          })
+        );
+
+        // Then delete from database
+        await prisma.image.deleteMany({
+          where: {
+            id: { in: imagesToDelete.map((id) => parseInt(id)) },
+            listingId: listing.id,
+          },
+        });
+      }
+
+      // Process new image uploads
+      const newImages = [];
+      if (req.files && req.files.length > 0) {
+        // Upload files to S3 and get URLs
+        const uploadResults = await Promise.all(
+          req.files.map((file) => uploadFileToS3(file))
+        );
+
+        newImages.push(
+          ...uploadResults.map((result, index) => ({
+            url: result.url,
+            isPrimary: index === 0 && listing.images.length === 0,
+            listingId: listing.id,
+          }))
+        );
+      }
+
+      // Prepare update data
+      const updateData = {
+        title,
+        description,
+        price: parseFloat(price),
+        negotiable: negotiable === "true" || negotiable === true,
+        categoryId,
+        cityId,
+        listingTier,
+        type,
+        tags: Array.isArray(tags)
+          ? tags
+          : typeof tags === "string"
+          ? tags
+              .split(",")
+              .map((t) => t.trim())
+              .filter((t) => t)
+          : [],
+        highlights: Array.isArray(highlights)
+          ? highlights
+          : typeof highlights === "string"
+          ? highlights
+              .split(",")
+              .map((h) => h.trim())
+              .filter((h) => h)
+          : [],
+        businessHours: businessHours,
+        phone: phone || null,
+        website: website || null,
+        businessCategory: businessCategory || null,
+        establishedYear: establishedYear ? parseInt(establishedYear) : null,
+        serviceArea: serviceArea || null,
+        teamSize: teamSize || null,
+        youtubeVideo: youtubeVideo || null,
+        locationUrl: locationUrl || null,
+        pincode: pincode ? parseInt(pincode) : null,
+        serviceRadius: serviceRadius ? parseInt(serviceRadius) : null,
+        updatedAt: new Date(),
+      };
+
+      // Update listing with transaction
+      const [updatedListing] = await prisma.$transaction([
+        prisma.listing.update({
+          where: { id: listing.id },
+          data: updateData,
+          include: {
+            images: true,
+            city: true,
+            category: true,
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                phone: true,
+              },
+            },
+            AdminApproval: true,
+          },
+        }),
+        ...(newImages.length > 0
+          ? [
+              prisma.image.createMany({
+                data: newImages,
+              }),
+            ]
+          : []),
+      ]);
+
+      res.json({
+        success: true,
+        data: updatedListing,
+        message: "Listing updated successfully",
+      });
+    } catch (error) {
+      console.error("Error updating listing:", error);
+
+      res.status(500).json({
+        success: false,
+        message: "Internal server error",
+        error:
+          process.env.NODE_ENV === "development" ? error.message : undefined,
       });
     }
-
-    res.json(updatedListing);
-  } catch (error) {
-    console.error("Update listing error:", error);
-    res.status(500).json({ message: "Error updating listing" });
   }
-});
+);
+
+// Helper function to update review stats
+async function updateListingReviewStats(listingId) {
+  const stats = await prisma.review.aggregate({
+    where: { listingId },
+    _avg: { rating: true },
+    _count: { id: true },
+  });
+
+  await prisma.listing.update({
+    where: { id: listingId },
+    data: {
+      rating: stats._avg.rating,
+      reviewCount: stats._count.id,
+    },
+  });
+}
 
 app.delete("/admin/listings/:id", authenticateToken, async (req, res) => {
   try {
@@ -1349,7 +1588,7 @@ app.put(
   async (req, res) => {
     try {
       const { id } = req.params;
-      const { duration = "SEVEN_DAYS" } = req.body;
+      const { duration = 7 } = req.body;
 
       await prisma.promotion.updateMany({
         where: { listingId: parseInt(id), isActive: true },
@@ -2704,7 +2943,6 @@ app.get("/home-banner", async (req, res) => {
   }
 });
 
-// Get banner by ID (protected)
 app.get("/home-banner/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2835,6 +3073,7 @@ app.delete("/home-banner/:id", authenticateToken, async (req, res) => {
   }
 });
 
+// Get all admin banners
 app.get("/admin-banners", async (req, res) => {
   try {
     const banners = await prisma.adminBanner.findMany({
@@ -2846,7 +3085,7 @@ app.get("/admin-banners", async (req, res) => {
   }
 });
 
-// Get banner by ID (protected)
+// Get admin banner by ID (protected)
 app.get("/admin-banners/:id", authenticateToken, async (req, res) => {
   try {
     const { id } = req.params;
@@ -2864,85 +3103,47 @@ app.get("/admin-banners/:id", authenticateToken, async (req, res) => {
   }
 });
 
+// Create new admin banner (protected)
 app.post("/admin-banners", authenticateToken, async (req, res) => {
   try {
-    const { Image, ListingUrl, active = true } = req.body;
+    const {
+      Image,
+      ListingUrl,
+      youtubeUrl,
+      pincode,
+      locationUrl,
+      expiresAt,
+      active = true,
+    } = req.body;
 
-    if (!Image) {
-      return res.status(400).json({ error: "Image is required" });
+    // Validate pincode if provided
+    if (pincode && (isNaN(pincode) || pincode < 0)) {
+      return res.status(400).json({ error: "Invalid pincode format" });
+    }
+
+    // Validate expiration date if provided
+    if (expiresAt && new Date(expiresAt) <= new Date()) {
+      return res
+        .status(400)
+        .json({ error: "Expiration date must be in the future" });
     }
 
     const newBanner = await prisma.adminBanner.create({
       data: {
         Image,
-        ListingUrl,
+        ListingUrl: ListingUrl || null,
+        youtubeUrl: youtubeUrl || null,
+        pincode: pincode ? Number(pincode) : null,
+        locationUrl: locationUrl || null,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
         active,
       },
     });
 
     res.status(201).json(newBanner);
   } catch (error) {
+    console.error("Create banner error:", error);
     res.status(500).json({ error: "Failed to create banner" });
-  }
-});
-
-app.post(
-  "/admin-banners/upload",
-  authenticateToken,
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "Image file is required" });
-      }
-
-      // Upload image to S3
-      const uploadResult = await uploadFileToS3(req.file);
-
-      // Create banner record in database
-      const { ListingUrl, active = true } = req.body;
-
-      const newBanner = await prisma.adminBanner.create({
-        data: {
-          Image: uploadResult.url,
-          ListingUrl,
-          active,
-        },
-      });
-
-      res.status(201).json(newBanner);
-    } catch (error) {
-      console.error("Upload error:", error);
-      res.status(500).json({
-        error: "Failed to upload banner",
-        details: error.message,
-      });
-    }
-  }
-);
-
-// Update banner (protected)
-app.put("/admin-banners/:id", authenticateToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { Image, ListingUrl, active } = req.body;
-
-    const updatedBanner = await prisma.adminBanner.update({
-      where: { id: Number(id) },
-      data: {
-        Image,
-        ListingUrl,
-        active,
-        updatedAt: new Date(),
-      },
-    });
-
-    res.json(updatedBanner);
-  } catch (error) {
-    if (error.code === "P2025") {
-      return res.status(404).json({ error: "Banner not found" });
-    }
-    res.status(500).json({ error: "Failed to update banner" });
   }
 });
 
@@ -2963,7 +3164,7 @@ app.delete("/admin-banners/:id", authenticateToken, async (req, res) => {
 
     await deleteFileFromS3(fileKey);
 
-    await prisma.banner.delete({
+    await prisma.adminBanner.delete({
       where: { id: Number(id) },
     });
 
@@ -2976,6 +3177,689 @@ app.delete("/admin-banners/:id", authenticateToken, async (req, res) => {
     res.status(500).json({ error: "Failed to delete banner" });
   }
 });
+
+app.post(
+  "/admin-banner/upload",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "Image file is required" });
+      }
+
+      // Upload image to S3
+      const uploadResult = await uploadFileToS3(req.file);
+
+      // Create banner record in database
+      const {
+        ListingUrl,
+        active = true,
+        locationUrl,
+        pincode,
+        expiresAt,
+      } = req.body;
+
+      const newBanner = await prisma.adminBanner.create({
+        data: {
+          Image: uploadResult.url,
+          ListingUrl,
+          locationUrl,
+          pincode,
+          expiresAt,
+          active,
+        },
+      });
+
+      res.status(201).json(newBanner);
+    } catch (error) {
+      console.error("Upload error:", error);
+      res.status(500).json({
+        error: "Failed to upload banner",
+        details: error.message,
+      });
+    }
+  }
+);
+
+// Update banner (protected)
+app.put("/admin-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { Image, ListingUrl, active, locationUrl, pincode, expiresAt } =
+      req.body;
+
+    const updatedBanner = await prisma.adminBanner.update({
+      where: { id: Number(id) },
+      data: {
+        Image,
+        ListingUrl,
+        locationUrl,
+        pincode,
+        active,
+        expiresAt,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.json(updatedBanner);
+  } catch (error) {
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to update banner" });
+  }
+});
+
+// Get all middle banners
+app.get("/middle-banners", async (req, res) => {
+  try {
+    const banners = await prisma.middleBanner.findMany({
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+// Create new middle banner (protected)
+app.post("/middle-banners", authenticateToken, async (req, res) => {
+  try {
+    const {
+      Image,
+      youtubeUrl,
+      ListingUrl,
+      pincode,
+      locationUrl,
+      expiresAt,
+      active = true,
+    } = req.body;
+
+    // Validate that either image or youtube URL is provided
+    if (!Image && !youtubeUrl) {
+      return res
+        .status(400)
+        .json({ error: "Either image or YouTube URL is required" });
+    }
+
+    // Validate pincode if provided
+    if (pincode && (isNaN(pincode) || pincode < 0)) {
+      return res.status(400).json({ error: "Invalid pincode format" });
+    }
+
+    // Validate YouTube URL format if provided
+    if (youtubeUrl) {
+      const youtubeRegex =
+        /^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/;
+      if (!youtubeRegex.test(youtubeUrl)) {
+        return res.status(400).json({ error: "Invalid YouTube URL format" });
+      }
+    }
+
+    // Validate expiration date if provided
+    if (expiresAt && new Date(expiresAt) <= new Date()) {
+      return res
+        .status(400)
+        .json({ error: "Expiration date must be in the future" });
+    }
+
+    const newBanner = await prisma.middleBanner.create({
+      data: {
+        Image: Image || null,
+        youtubeUrl: youtubeUrl || null,
+        ListingUrl: ListingUrl || null,
+        pincode: pincode ? Number(pincode) : null,
+        locationUrl: locationUrl || null,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        active,
+      },
+    });
+
+    res.status(201).json(newBanner);
+  } catch (error) {
+    console.error("Create banner error:", error);
+    res.status(500).json({ error: "Failed to create banner" });
+  }
+});
+
+// Update banner (protected)
+app.put("/middle-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      Image,
+      youtubeUrl,
+      ListingUrl,
+      active,
+      locationUrl,
+      pincode,
+      expiresAt,
+    } = req.body;
+
+    // Validate that either image or youtube URL is provided
+    if (!Image && !youtubeUrl) {
+      return res
+        .status(400)
+        .json({ error: "Either image or YouTube URL is required" });
+    }
+
+    const updatedBanner = await prisma.middleBanner.update({
+      where: { id: Number(id) },
+      data: {
+        Image,
+        youtubeUrl,
+        ListingUrl,
+        locationUrl,
+        pincode,
+        active,
+        expiresAt,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.json(updatedBanner);
+  } catch (error) {
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to update banner" });
+  }
+});
+
+// Upload image (protected)
+app.post(
+  "/middle-banners/upload",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "Image file is required" });
+      }
+
+      // Upload image to S3
+      const uploadResult = await uploadFileToS3(req.file);
+
+      res.status(200).json({
+        Image: uploadResult.url,
+        message: "Image uploaded successfully",
+      });
+    } catch (error) {
+      console.error("Upload error:", error);
+      res.status(500).json({
+        error: "Failed to upload image",
+        details: error.message,
+      });
+    }
+  }
+);
+
+// Delete banner (protected)
+app.delete("/middle-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const banner = await prisma.middleBanner.findUnique({
+      where: { id: Number(id) },
+    });
+
+    if (!banner) {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+
+    // Delete image from S3 if it exists
+    if (banner.Image) {
+      const url = new URL(banner.Image);
+      const fileKey = url.pathname.substring(1);
+      await deleteFileFromS3(fileKey);
+    }
+
+    await prisma.middleBanner.delete({
+      where: { id: Number(id) },
+    });
+
+    res.status(204).end();
+  } catch (error) {
+    console.error("Delete error:", error);
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to delete banner" });
+  }
+});
+
+// Get all bottom banners
+app.get("/bottom-banners", async (req, res) => {
+  try {
+    const banners = await prisma.bottomBanner.findMany({
+      orderBy: { createdAt: "desc" },
+    });
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+// Create new bottom banner (protected)
+app.post("/bottom-banners", authenticateToken, async (req, res) => {
+  try {
+    const {
+      Image,
+      youtubeUrl,
+      ListingUrl,
+      pincode,
+      locationUrl,
+      expiresAt,
+      active = true,
+    } = req.body;
+
+    // Validate that either image or youtube URL is provided
+    if (!Image && !youtubeUrl) {
+      return res
+        .status(400)
+        .json({ error: "Either image or YouTube URL is required" });
+    }
+
+    // Validate pincode if provided
+    if (pincode && (isNaN(pincode) || pincode < 0)) {
+      return res.status(400).json({ error: "Invalid pincode format" });
+    }
+
+    // Validate YouTube URL format if provided
+    if (youtubeUrl) {
+      const youtubeRegex =
+        /^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/;
+      if (!youtubeRegex.test(youtubeUrl)) {
+        return res.status(400).json({ error: "Invalid YouTube URL format" });
+      }
+    }
+
+    // Validate expiration date if provided
+    if (expiresAt && new Date(expiresAt) <= new Date()) {
+      return res
+        .status(400)
+        .json({ error: "Expiration date must be in the future" });
+    }
+
+    const newBanner = await prisma.bottomBanner.create({
+      data: {
+        Image: Image || null,
+        youtubeUrl: youtubeUrl || null,
+        ListingUrl: ListingUrl || null,
+        pincode: pincode ? Number(pincode) : null,
+        locationUrl: locationUrl || null,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        active,
+      },
+    });
+
+    res.status(201).json(newBanner);
+  } catch (error) {
+    console.error("Create banner error:", error);
+    res.status(500).json({ error: "Failed to create banner" });
+  }
+});
+
+// Update banner (protected)
+app.put("/bottom-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      Image,
+      youtubeUrl,
+      ListingUrl,
+      active,
+      locationUrl,
+      pincode,
+      expiresAt,
+    } = req.body;
+
+    // Validate that either image or youtube URL is provided
+    if (!Image && !youtubeUrl) {
+      return res
+        .status(400)
+        .json({ error: "Either image or YouTube URL is required" });
+    }
+
+    const updatedBanner = await prisma.bottomBanner.update({
+      where: { id: Number(id) },
+      data: {
+        Image,
+        youtubeUrl,
+        ListingUrl,
+        locationUrl,
+        pincode,
+        active,
+        expiresAt,
+        updatedAt: new Date(),
+      },
+    });
+
+    res.json(updatedBanner);
+  } catch (error) {
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to update banner" });
+  }
+});
+
+// Upload image (protected)
+app.post(
+  "/bottom-banners/upload",
+  authenticateToken,
+  upload.single("image"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "Image file is required" });
+      }
+
+      // Upload image to S3
+      const uploadResult = await uploadFileToS3(req.file);
+
+      res.status(200).json({
+        Image: uploadResult.url,
+        message: "Image uploaded successfully",
+      });
+    } catch (error) {
+      console.error("Upload error:", error);
+      res.status(500).json({
+        error: "Failed to upload image",
+        details: error.message,
+      });
+    }
+  }
+);
+
+// Delete banner (protected)
+app.delete("/bottom-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const banner = await prisma.bottomBanner.findUnique({
+      where: { id: Number(id) },
+    });
+
+    if (!banner) {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+
+    // Delete image from S3 if it exists
+    if (banner.Image) {
+      const url = new URL(banner.Image);
+      const fileKey = url.pathname.substring(1);
+      await deleteFileFromS3(fileKey);
+    }
+
+    await prisma.bottomBanner.delete({
+      where: { id: Number(id) },
+    });
+
+    res.status(204).end();
+  } catch (error) {
+    console.error("Delete error:", error);
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to delete banner" });
+  }
+});
+
+// Get all category banners
+app.get("/category-banners", async (req, res) => {
+  try {
+    const banners = await prisma.categoryBanner.findMany({
+      orderBy: { createdAt: "desc" },
+      include: {
+        category: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch banners" });
+  }
+});
+
+// Create new admin banner (protected)
+app.post("/category-banners", authenticateToken, async (req, res) => {
+  try {
+    const {
+      Image,
+      youtubeUrl,
+      categoryId,
+      ListingUrl,
+      pincode,
+      locationUrl,
+      expiresAt,
+      active = true,
+    } = req.body;
+
+    if (!categoryId) {
+      return res.status(400).json({ error: "Category is required" });
+    }
+
+    // Validate that either image or youtube URL is provided
+    if (!Image && !youtubeUrl) {
+      return res
+        .status(400)
+        .json({ error: "Either image or YouTube URL is required" });
+    }
+
+    // Validate YouTube URL format if provided
+    if (youtubeUrl) {
+      const youtubeRegex =
+        /^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+$/;
+      if (!youtubeRegex.test(youtubeUrl)) {
+        return res.status(400).json({ error: "Invalid YouTube URL format" });
+      }
+    }
+
+    // Validate pincode if provided
+    if (pincode && (isNaN(pincode) || pincode < 0)) {
+      return res.status(400).json({ error: "Invalid pincode format" });
+    }
+
+    // Validate expiration date if provided
+    if (expiresAt && new Date(expiresAt) <= new Date()) {
+      return res
+        .status(400)
+        .json({ error: "Expiration date must be in the future" });
+    }
+
+    const newBanner = await prisma.categoryBanner.create({
+      data: {
+        Image: Image || null,
+        youtubeUrl: youtubeUrl || null,
+        categoryId,
+        ListingUrl: ListingUrl || null,
+        pincode: pincode ? Number(pincode) : null,
+        locationUrl: locationUrl || null,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        active,
+      },
+      include: {
+        category: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    res.status(201).json(newBanner);
+  } catch (error) {
+    console.error("Create banner error:", error);
+    res.status(500).json({ error: "Failed to create banner" });
+  }
+});
+
+// Update banner (protected)
+app.put("/category-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      Image,
+      youtubeUrl,
+      categoryId,
+      ListingUrl,
+      active,
+      locationUrl,
+      pincode,
+      expiresAt,
+    } = req.body;
+
+    if (!categoryId) {
+      return res.status(400).json({ error: "Category is required" });
+    }
+
+    // Validate that either image or youtube URL is provided
+    if (!Image && !youtubeUrl) {
+      return res
+        .status(400)
+        .json({ error: "Either image or YouTube URL is required" });
+    }
+
+    const updatedBanner = await prisma.categoryBanner.update({
+      where: { id: Number(id) },
+      data: {
+        Image,
+        youtubeUrl,
+        categoryId,
+        ListingUrl,
+        locationUrl,
+        pincode: pincode ? Number(pincode) : null,
+        active,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+        updatedAt: new Date(),
+      },
+      include: {
+        category: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    res.json(updatedBanner);
+  } catch (error) {
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to update banner" });
+  }
+});
+
+// Delete banner (protected)
+app.delete("/category-banners/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const banner = await prisma.categoryBanner.findUnique({
+      where: { id: Number(id) },
+    });
+
+    if (!banner) {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+
+    // Delete image from S3 if it exists
+    if (banner.Image) {
+      const url = new URL(banner.Image);
+      const fileKey = url.pathname.substring(1);
+      await deleteFileFromS3(fileKey);
+    }
+
+    await prisma.categoryBanner.delete({
+      where: { id: Number(id) },
+    });
+
+    res.status(204).end();
+  } catch (error) {
+    console.error("Delete error:", error);
+    if (error.code === "P2025") {
+      return res.status(404).json({ error: "Banner not found" });
+    }
+    res.status(500).json({ error: "Failed to delete banner" });
+  }
+});
+
+app.put(
+  "/:bannerType/:id/toggle-status",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { bannerType, id } = req.params;
+
+      // Validate banner type
+      console.log(bannerType);
+      const validBannerTypes = [
+        "admin-banners",
+        "middle-banners",
+        "bottom-banners",
+        "category-banners",
+      ];
+      if (!validBannerTypes.includes(bannerType)) {
+        return res.status(400).json({ error: "Invalid banner type" });
+      }
+
+      // Determine the Prisma model based on banner type
+      let prismaModel;
+      switch (bannerType) {
+        case "admin-banners":
+          prismaModel = prisma.adminBanner;
+          break;
+        case "middle-banners":
+          prismaModel = prisma.middleBanner;
+          break;
+        case "bottom-banners":
+          prismaModel = prisma.bottomBanner;
+          break;
+        case "category-banners":
+          prismaModel = prisma.categoryBanner;
+          break;
+      }
+
+      // Get current status
+      const banner = await prismaModel.findUnique({
+        where: { id: Number(id) },
+      });
+
+      if (!banner) {
+        return res.status(404).json({ error: "Banner not found" });
+      }
+
+      // Toggle the status
+      const updatedBanner = await prismaModel.update({
+        where: { id: Number(id) },
+        data: {
+          active: !banner.active,
+          updatedAt: new Date(),
+        },
+      });
+
+      res.json({
+        message: "Banner status updated successfully",
+        banner: updatedBanner,
+      });
+    } catch (error) {
+      console.error("Error toggling banner status:", error);
+      if (error.code === "P2025") {
+        return res.status(404).json({ error: "Banner not found" });
+      }
+      res.status(500).json({ error: "Failed to update banner status" });
+    }
+  }
+);
 
 app.get("/admin/payment", authenticateToken, async (req, res) => {
   try {

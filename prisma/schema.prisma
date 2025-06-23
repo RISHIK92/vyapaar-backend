@@ -38,13 +38,14 @@ model Admin {
 }
 
 model Category {
-  id        String    @id @default(uuid())
-  name      String    @unique
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  listings  Listing[]
+  id           String             @id @default(uuid())
+  name         String             @unique
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
 
+  listings     Listing[]
   HomeCategory HomeCategory[]
+  banners      CategoryBanner[]
 }
 
 model City {
@@ -86,6 +87,7 @@ model Listing {
   subscriptionId   String?
   youtubeVideo     String?
   locationUrl      String?
+  pincode          Int?
   serviceRadius    Int? 
   AdminApproval    AdminApproval?
   Favorite         Favorite[]
@@ -160,22 +162,72 @@ model Promotion {
   @@index([endDate])
 }
 
-model AdminBanner {
+model Banner {
   id          Int        @id @default(autoincrement())
-  Image       String
+  Image       String?
+  youtubeUrl  String?
   ListingUrl  String?
+  pincode     Int?
+  locationUrl String?
   active      Boolean    @default(true)
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @default(now())
 }
 
-model Banner {
+// Repeat the same pattern for other banner models
+model AdminBanner {
   id          Int        @id @default(autoincrement())
-  Image       String
+  Image       String?
+  youtubeUrl  String?
   ListingUrl  String?
+  pincode     Int?
+  locationUrl String?
   active      Boolean    @default(true)
+  expiresAt   DateTime?
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @default(now())
+}
+
+model MiddleBanner {
+  id          Int        @id @default(autoincrement())
+  Image       String?
+  youtubeUrl  String?
+  ListingUrl  String?
+  pincode     Int?
+  locationUrl String?
+  active      Boolean    @default(true)
+  expiresAt   DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @default(now())
+}
+
+model BottomBanner {
+  id          Int        @id @default(autoincrement())
+  Image       String?
+  youtubeUrl  String?
+  ListingUrl  String?
+  pincode     Int?
+  locationUrl String?
+  active      Boolean    @default(true)
+  expiresAt   DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @default(now())
+}
+
+model CategoryBanner {
+  id          Int       @id @default(autoincrement())
+  Image       String?
+  youtubeUrl  String?
+  ListingUrl  String?
+  pincode     Int?
+  locationUrl String?
+  active      Boolean   @default(true)
+  expiresAt   DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now())
+
+  categoryId  String
+  category    Category   @relation(fields: [categoryId], references: [id])
 }
 
 model SubscriptionPlan {
