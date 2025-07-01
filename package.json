@@ -4,8 +4,8 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"nodemon src/index.js\" \"nodemon src/script.js\"",
-    "start": "concurrently \"nodemon src/index.js\" \"nodemon src/script.js\""
+    "dev": "nodemon src/index.js",
+    "start": "nodemon src/index.js"
   },
   "keywords": [],
   "author": "",
